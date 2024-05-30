@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- optimization_v1alpha1_istioadaptiverequestoptimizer.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

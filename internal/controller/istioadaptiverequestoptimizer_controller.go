@@ -1,0 +1,455 @@
+/*
+Copyright 2024.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
+	"istio-adaptive-least-request/helpers"
+	customMetrics "istio-adaptive-least-request/metrics"
+	istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
+	istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"strings"
+	_ "strings"
+)
+
+const istioAdaptiveRequestOptimizerFinalizer = "optimization.liorfranko.github.io/finalizer"
+
+// DefaultWeightForNewEndpoints represents the default weight assigned to new endpoints in a ServiceEntry.
+const DefaultWeightForNewEndpoints uint32 = 1000
+
+// IstioAdaptiveRequestOptimizerReconciler reconciles a IstioAdaptiveRequestOptimizer object
+type IstioAdaptiveRequestOptimizerReconciler struct {
+	client.Client
+	Scheme                          *runtime.Scheme
+	LoggerName                      string
+	EndpointsAnnotationKey          *string
+	EndpointsPodScrapeAnnotationKey *string
+	ServiceEntryLabelKey            *string
+	ServiceEntryServiceNameLabelKey *string
+	NamespaceList                   []string
+}
+
+// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers/finalizers,verbs=update
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=core,resources=endpoints,verbs=update;patch;get;list;watch
+//+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/finalizers,verbs=update
+
+func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	logger.V(1).Info("Reconcile IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer.Namespace", req.Namespace, "IstioAdaptiveRequestOptimizer.Name", req.Name)
+	// Fetch the IstioAdaptiveRequestOptimizer instance
+	optimizer := &optimizationv1alpha1.IstioAdaptiveRequestOptimizer{}
+	if err := r.Get(ctx, req.NamespacedName, optimizer); err != nil {
+		logger.Info("IstioAdaptiveRequestOptimizer not found", "Namespace", req.Namespace, "Name", req.Name)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	logger.V(1).Info("IstioAdaptiveRequestOptimizer fetched", "IstioAdaptiveRequestOptimizer", optimizer.Spec)
+
+	if optimizer.GetDeletionTimestamp() != nil {
+		logger.Info("IstioAdaptiveRequestOptimizer marked for deletion", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+		_, err := r.handleFinalizer(ctx, optimizer)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// If the object is not marked for deletion and does not have a finalizer
+	if !helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
+		// Attempt to add the finalizer
+		logger.Info("Finalizer not found, adding finalizer")
+		if err := r.addFinalizer(ctx, optimizer); err != nil {
+			logger.Error(err, "Failed to add finalizer")
+			// Return with error to requeue and try adding finalizer again
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Fetch the Service based on the optimizer spec
+	service := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, service); err != nil {
+		logger.Error(err, "Failed to fetch Service", "ServiceName", optimizer.Spec.ServiceName)
+		return ctrl.Result{}, err
+	}
+	logger.V(1).Info("Service fetched", "Service", service)
+	// Fetch the Endpoints object matching the service
+	endpoints := &corev1.Endpoints{}
+	if err := r.Get(ctx, client.ObjectKey{Name: service.Name, Namespace: service.Namespace}, endpoints); err != nil {
+		logger.Error(err, "Failed to fetch Endpoints for Service", "ServiceName", service.Name)
+		return ctrl.Result{}, err
+	}
+	if err := r.annotateEndpoints(ctx, *endpoints, optimizer); err != nil {
+		logger.Error(err, "Failed to annotate Endpoints", "ServiceName", service.Name)
+		return ctrl.Result{}, err
+	}
+
+	portsToProcess := r.collectPortsToProcess(optimizer, service)
+	logger.V(1).Info("Ports to process", "Ports", portsToProcess)
+	var createdServiceEntries []*istioClientV1beta1.ServiceEntry
+	for _, port := range portsToProcess {
+		// Assume createServiceEntry returns a pointer to a ServiceEntry and error
+		serviceEntry, err := r.createServiceEntry(ctx, service, port, endpoints.Subsets, *optimizer)
+		if err != nil {
+			logger.Error(err, "Failed to create ServiceEntry for port", "Port", port.Port)
+			// TODO: Add a metric for failed ServiceEntry creation
+			continue // Skip this iteration on error
+		}
+		createdServiceEntries = append(createdServiceEntries, serviceEntry)
+	}
+
+	if err := r.updateOptimizerStatus(ctx, optimizer, createdServiceEntries); err != nil {
+		logger.Error(err, "Failed to update optimizer status with service entries")
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context.Context, namespace, name string) *istioClientV1beta1.ServiceEntry {
+	var serviceEntry istioClientV1beta1.ServiceEntry
+	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, &serviceEntry)
+	if err != nil {
+		return nil
+	}
+	return &serviceEntry
+}
+
+// createServiceEntry constructs a ServiceEntry resource based on the provided Service and ServicePort.
+// It then creates the ServiceEntry in the Kubernetes API server.
+func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, subsets []corev1.EndpointSubset, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1beta1.ServiceEntry, error) {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	host := fmt.Sprintf("%s.%s.svc.cluster.local", service.Name, service.Namespace)
+
+	var serviceEntryEndpoints []*istioNetworkingV1beta1.WorkloadEntry
+	for _, subset := range subsets {
+		for _, address := range subset.Addresses {
+			serviceEndpoint := &istioNetworkingV1beta1.WorkloadEntry{
+				Address: address.IP,
+				Weight:  DefaultWeightForNewEndpoints,
+			}
+			serviceEntryEndpoints = append(serviceEntryEndpoints, serviceEndpoint)
+		}
+	}
+
+	// Construct the ServiceEntry resource
+	serviceEntry := &istioClientV1beta1.ServiceEntry{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "networking.istio.io/v1beta1",
+			Kind:       "ServiceEntry",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      service.Name + "-" + fmt.Sprint(port.Port),
+			Namespace: service.Namespace,
+			Labels: map[string]string{
+				*r.ServiceEntryLabelKey:            "true",
+				*r.ServiceEntryServiceNameLabelKey: service.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Name:       optimizer.Name,
+					APIVersion: optimizer.APIVersion,
+					Kind:       optimizer.Kind,
+					UID:        optimizer.UID,
+				},
+			},
+		},
+		Spec: istioNetworkingV1beta1.ServiceEntry{
+			Hosts: []string{host},
+			Ports: []*istioNetworkingV1beta1.ServicePort{
+				{
+					Number:   uint32(port.Port),
+					Protocol: helpers.SafeDereferenceAppProtocol(port.AppProtocol),
+					Name:     port.Name,
+				},
+			},
+			Endpoints:  serviceEntryEndpoints,
+			Location:   istioNetworkingV1beta1.ServiceEntry_MESH_INTERNAL,
+			Resolution: istioNetworkingV1beta1.ServiceEntry_STATIC,
+		},
+	}
+
+	existServiceEntry := r.serviceEntryExists(ctx, service.Namespace, service.Name+"-"+fmt.Sprint(port.Port))
+	if existServiceEntry != nil {
+		//logger.Info("ServiceEntry already exists", "ServiceEntry", service.Name+"-"+fmt.Sprint(port.Port))
+		return existServiceEntry, nil
+	}
+
+	// Create ServiceEntry resource
+	logger.Info("Creating ServiceEntry", "ServiceEntry", serviceEntry.Name)
+	err := r.Create(ctx, serviceEntry)
+	if err != nil {
+		logger.Error(err, "Failed to create ServiceEntry", "ServiceEntry", serviceEntry.Name)
+		return nil, err
+	}
+	logger.Info("ServiceEntry created successfully", "ServiceEntry", serviceEntry.Name)
+	return serviceEntry, nil
+}
+
+// handleFinalizer handles the finalizer logic for the IstioAdaptiveRequestOptimizer resource
+func (r *IstioAdaptiveRequestOptimizerReconciler) handleFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+
+	// If the resource is marked for deletion
+	if helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
+		if err := r.cleanupSpecificEndpointAnnotations(ctx, optimizer, []string{*r.EndpointsAnnotationKey}); err != nil {
+			logger.Error(err, "Error cleaning up specific Endpoint annotations")
+			// Return with error to requeue and try cleanup again
+			return ctrl.Result{}, err
+		}
+
+		if err := r.cleanupSpecificPodAnnotations(ctx, optimizer, []string{*r.EndpointsAnnotationKey, *r.EndpointsPodScrapeAnnotationKey}); err != nil {
+			logger.Error(err, "Error cleaning up specific Pod annotations")
+			// Return with error to requeue and try cleanup again
+			return ctrl.Result{}, err
+		}
+
+		if err := r.removeFinalizer(ctx, optimizer); err != nil {
+			logger.Error(err, "Failed to remove finalizer")
+			// Return with error to requeue and try finalizer removal again
+			return ctrl.Result{}, err
+		}
+	}
+	// After finalizer is handled, no need to requeue
+	return ctrl.Result{}, nil
+}
+
+// addFinalizer adds the finalizer to the IstioAdaptiveRequestOptimizer
+func (r *IstioAdaptiveRequestOptimizerReconciler) addFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
+	if !helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
+		logger := log.FromContext(ctx).WithName(r.LoggerName)
+		logger.Info("Adding Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+		optimizer.SetFinalizers(append(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer))
+		// Update CR to add finalizer
+		if err := r.Update(ctx, optimizer); err != nil {
+			logger.Error(err, "Failed to add finalizer to IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+			return err
+		}
+	}
+	return nil
+}
+
+// removeFinalizer removes the finalizer from the IstioAdaptiveRequestOptimizer
+func (r *IstioAdaptiveRequestOptimizerReconciler) removeFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
+	if helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
+		logger := log.FromContext(ctx).WithName(r.LoggerName)
+		logger.Info("Removing Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+		optimizer.SetFinalizers(helpers.RemoveString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer))
+
+		// Update CR to remove the finalizer
+		if err := r.Update(ctx, optimizer); err != nil {
+			logger.Error(err, "Failed to remove finalizer from IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+			return err
+		}
+	}
+	return nil
+}
+
+// collectPortsToProcess returns the list of ServicePorts to process based on the optimizer spec and the Service.
+func (r *IstioAdaptiveRequestOptimizerReconciler) collectPortsToProcess(optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, service *corev1.Service) []corev1.ServicePort {
+	var portsToProcess []corev1.ServicePort
+	// TODO log and add a metric when the user add a port that does not exist in the service
+	if len(optimizer.Spec.ServicePorts) > 0 {
+		optimizerPortsMap := make(map[string]bool)
+		for _, optimizerPort := range optimizer.Spec.ServicePorts {
+			// Normalize protocol to "TCP" for "HTTP" and "gRPC"
+			normalizedProtocol := normalizeProtocol(optimizerPort.Protocol)
+			portProtocolKey := fmt.Sprintf("%d/%s", optimizerPort.Number, normalizedProtocol)
+			optimizerPortsMap[portProtocolKey] = true
+		}
+
+		for _, servicePort := range service.Spec.Ports {
+			// Ensure service port protocol is compared in a normalized form
+			normalizedServiceProtocol := normalizeProtocol(string(servicePort.Protocol))
+			portProtocolKey := fmt.Sprintf("%d/%s", servicePort.Port, normalizedServiceProtocol)
+			if _, exists := optimizerPortsMap[portProtocolKey]; exists {
+				portsToProcess = append(portsToProcess, servicePort)
+			}
+		}
+		return portsToProcess // Return early with the matched ports
+	}
+
+	// Default to using all ports from the service if no specific ports are defined in the optimizer
+	return service.Spec.Ports
+}
+
+// normalizeProtocol converts high-level protocol names to their underlying transport protocol.
+func normalizeProtocol(protocol string) string {
+	lowerProtocol := strings.ToLower(protocol)
+	switch lowerProtocol {
+	case "http", "grpc":
+		return "tcp" // Treat both HTTP and gRPC as TCP, in lowercase
+	default:
+		return lowerProtocol // Return the protocol in lowercase if not HTTP or gRPC
+	}
+}
+
+func (r *IstioAdaptiveRequestOptimizerReconciler) annotateEndpoints(ctx context.Context, endpoints corev1.Endpoints, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
+	// Skip if the optimizer is marked for deletion
+	if optimizer.GetDeletionTimestamp() != nil {
+		return nil
+	}
+
+	if len(optimizer.Spec.ServicePorts) > 0 {
+		// Add the optimizer annotation to the Endpoints object
+		if endpoints.Annotations == nil {
+			endpoints.Annotations = make(map[string]string)
+		}
+		endpoints.Annotations[*r.EndpointsAnnotationKey] = "true"
+
+		// Update the Endpoints object with the new annotations
+		if err := r.Update(ctx, &endpoints); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificEndpointAnnotations(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, annotationKeysToRemove []string) error {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	logger.Info("Cleaning up specific Endpoint annotations for IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+
+	// Fetch the Endpoints object
+	endpoints := &corev1.Endpoints{}
+	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, endpoints); err != nil {
+		logger.Error(err, "Failed to fetch Endpoints for Service", "ServiceName", optimizer.Spec.ServiceName)
+		return err
+	}
+
+	modified := false
+	// Iterate over the list of annotation keys that need to be removed
+	for _, key := range annotationKeysToRemove {
+		if _, found := endpoints.Annotations[key]; found {
+			delete(endpoints.Annotations, key)
+			modified = true
+		}
+	}
+
+	// Update the Endpoints object to reflect the changes, if any annotation was removed
+	if modified {
+		err := r.Update(ctx, endpoints)
+		if err != nil {
+			logger.Error(err, "Failed to update Endpoints after removing specific annotations", "Endpoints", endpoints.Name, "keysRemoved", annotationKeysToRemove)
+			// If you want to handle errors in a specific way, do it here.
+			return err
+		}
+		logger.V(1).Info("Specific annotations removed from Endpoints", "Endpoints", endpoints.Name, "keysRemoved", annotationKeysToRemove)
+	}
+
+	return nil
+}
+
+func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificPodAnnotations(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, annotationKeysToRemove []string) error {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	logger.Info("Initiating cleanup of specific Pod annotations", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+	logger.Info("Preparing to remove Prometheus metrics for the service", "service_name", optimizer.Spec.ServiceName, "service_namespace", optimizer.Spec.ServiceNamespace)
+
+	// Define Prometheus metrics to be removed
+	metricsToRemove := []*prometheus.GaugeVec{
+		customMetrics.AlphaMetric,
+		customMetrics.DistanceMetric,
+		customMetrics.MultiplierMetric,
+		customMetrics.WeightMetric,
+		customMetrics.ResponseTimeMetric,
+		// Extend with additional metrics as necessary
+	}
+
+	// Retrieve the Service to access its Pod selector
+	service := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, service); err != nil {
+		logger.Error(err, "Failed to retrieve the Service", "ServiceName", optimizer.Spec.ServiceName)
+		return err
+	}
+
+	// List all Pods in the namespace that match the Service's selector
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(optimizer.Spec.ServiceNamespace), client.MatchingLabels(service.Spec.Selector)); err != nil {
+		logger.Error(err, "Failed to list matching Pods for the Service", "ServiceName", optimizer.Spec.ServiceName)
+		return err
+	}
+
+	// Iterate through each Pod to remove metrics and annotations
+	for _, pod := range podList.Items {
+		// Remove Prometheus metrics associated with the Pod
+		for _, metricVec := range metricsToRemove {
+			if !metricVec.Delete(prometheus.Labels{"service_name": optimizer.Spec.ServiceName, "service_namespace": optimizer.Spec.ServiceNamespace, "pod_name": pod.Name, "pod_ip": pod.Status.PodIP}) {
+				logger.Info("No Prometheus metrics found for removal", "service_name", optimizer.Spec.ServiceName, "service_namespace", optimizer.Spec.ServiceNamespace)
+				continue
+			}
+			logger.Info("Prometheus metrics successfully removed", "service_name", optimizer.Spec.ServiceName, "service_namespace", optimizer.Spec.ServiceNamespace, "metric_name", metricVec)
+		}
+
+		// Remove specified annotations from the Pod
+		modified := false
+		for _, key := range annotationKeysToRemove {
+			if _, found := pod.Annotations[key]; found {
+				delete(pod.Annotations, key)
+				modified = true
+			}
+		}
+
+		// Update the Pod if any annotations were removed
+		if modified {
+			if err := r.Update(ctx, &pod); err != nil {
+				logger.Error(err, "Failed to update Pod after annotation removal", "PodName", pod.Name)
+				continue // Proceed with the next Pod instead of halting
+			}
+			logger.V(1).Info("Removed specified annotations from Pod", "PodName", pod.Name, "keysRemoved", annotationKeysToRemove)
+		}
+	}
+	return nil
+}
+
+func (r *IstioAdaptiveRequestOptimizerReconciler) updateOptimizerStatus(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntries []*istioClientV1beta1.ServiceEntry) error {
+	var statusEntries []optimizationv1alpha1.ServiceEntry
+	for _, serviceEntry := range serviceEntries {
+		statusEntries = append(statusEntries, optimizationv1alpha1.ServiceEntry{
+			Name:         serviceEntry.Name,
+			Namespace:    serviceEntry.Namespace,
+			CreationTime: serviceEntry.CreationTimestamp,
+		})
+	}
+
+	// Properly update the optimizer status with the new slice
+	optimizer.Status.ServiceEntries = statusEntries
+
+	return r.Status().Update(ctx, optimizer)
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *IstioAdaptiveRequestOptimizerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	namespacePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		return helpers.NamespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
+	})
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&optimizationv1alpha1.IstioAdaptiveRequestOptimizer{}).
+		WithEventFilter(namespacePredicate).
+		Complete(r)
+}

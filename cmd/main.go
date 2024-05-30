@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -33,6 +34,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
+	"istio-adaptive-least-request/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -44,6 +48,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
+	utilruntime.Must(optimizationv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -53,6 +58,12 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var endpointsAnnotationKey string
+	var endpointPodScrapeAnnotationKey string
+	var serviceEntryLabelKey string
+	var serviceEntryServiceNameLabelKey string
+	var namespaces string
+
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. "+
 		"Use the port :8080. If not set, it will be 0 in order to disable the metrics server")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -63,11 +74,21 @@ func main() {
 		"If set the metrics endpoint is served securely")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&endpointsAnnotationKey, "endpoints-annotation", "istio.adaptive.request.optimizer/optimize", "The annotation to use for setting that the endpoints object is optimized")
+	flag.StringVar(&endpointPodScrapeAnnotationKey, "endpoint-pod-scrape-annotation", "istio.adaptive.request.optimizer/scrape", "The annotation to use for setting that the endpoints object is to be scraped")
+	flag.StringVar(&serviceEntryLabelKey, "serviceentry-label", "istio.adaptive.request.optimizer/optimize", "The label to use for setting that the ServiceEntry object is optimized")
+	flag.StringVar(&serviceEntryServiceNameLabelKey, "serviceentry-service-name-label", "istio.adaptive.request.optimizer/service-name", "The label to use for setting the service name in the ServiceEntry object")
+	flag.StringVar(&namespaces, "namespaces", "", "Comma-separated list of namespaces to watch")
+
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	var namespaceList []string
+	if namespaces != "" {
+		namespaceList = strings.Split(namespaces, ",")
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -119,6 +140,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&controller.IstioAdaptiveRequestOptimizerReconciler{
+		Client:                          mgr.GetClient(),
+		Scheme:                          mgr.GetScheme(),
+		LoggerName:                      "IstioAdaptiveRequestOptimizer",
+		EndpointsAnnotationKey:          &endpointsAnnotationKey,
+		EndpointsPodScrapeAnnotationKey: &endpointPodScrapeAnnotationKey,
+		ServiceEntryLabelKey:            &serviceEntryLabelKey,
+		ServiceEntryServiceNameLabelKey: &serviceEntryServiceNameLabelKey,
+		NamespaceList:                   namespaceList,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "IstioAdaptiveRequestOptimizer")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
