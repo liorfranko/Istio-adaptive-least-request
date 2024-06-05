@@ -1,5 +1,10 @@
 package helpers
 
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	customMetrics "istio-adaptive-least-request/metrics"
+)
+
 // ContainsString checks if a string is present in a slice of strings.
 func ContainsString(slice []string, s string) bool {
 	for _, item := range slice {
@@ -37,4 +42,24 @@ func NamespaceInFilteredList(namespace string, filteredNamespaces []string) bool
 		}
 	}
 	return false
+}
+
+func CleanupPodMetrics(serviceName string, serviceNamespace string, podName string, podIP string) int {
+	// Define Prometheus metrics to be removed
+	removedMetrics := 0
+	metricsToRemove := []*prometheus.GaugeVec{
+		customMetrics.AlphaMetric,
+		customMetrics.DistanceMetric,
+		customMetrics.MultiplierMetric,
+		customMetrics.WeightMetric,
+		customMetrics.ResponseTimeMetric,
+		customMetrics.NormalizedWeightMetric,
+	}
+	for _, metricVec := range metricsToRemove {
+		if !metricVec.Delete(prometheus.Labels{"service_name": serviceName, "service_namespace": serviceNamespace, "pod_name": podName, "pod_ip": podIP}) {
+			continue
+		}
+		removedMetrics++
+	}
+	return removedMetrics
 }

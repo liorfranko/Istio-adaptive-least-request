@@ -49,14 +49,6 @@ var (
 		},
 		[]string{"pod_name", "pod_ip", "service_name", "service_namespace"}, // Label by pod name, IP, service name, and namespace
 	)
-	// ResponsesTrendMetric tracks the responses trend for service entry endpoints, labeled by pod name and IP.
-	ResponsesTrendMetric = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "endpoint_responses_trend",
-			Help: "Responses trend of a service entry endpoint.",
-		},
-		[]string{"pod_name", "pod_ip", "service_name", "service_namespace"}, // Label by pod name, IP, service name, and namespace
-	)
 	NormalizedWeightMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "endpoint_normalized_weight",
@@ -64,9 +56,18 @@ var (
 		},
 		[]string{"pod_name", "pod_ip", "service_name", "service_namespace"}, // Label by pod name, IP, service name, and namespace
 	)
+
+	// ErrorMetrics tracks various error occurrences within the reconciler
+	ErrorMetrics = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "reconciler_errors",
+			Help: "Counts of various errors that occur within the reconciler.",
+		},
+		[]string{"controller", "type", "name", "namespace"}, // Differentiate by error type and associated service details
+	)
 )
 
 func init() {
 	// Register custom metrics with Prometheus's default registry
-	metrics.Registry.MustRegister(AlphaMetric, DistanceMetric, MultiplierMetric, ResponseTimeMetric, WeightMetric, ResponsesTrendMetric, NormalizedWeightMetric)
+	metrics.Registry.MustRegister(AlphaMetric, DistanceMetric, MultiplierMetric, ResponseTimeMetric, WeightMetric, NormalizedWeightMetric, ErrorMetrics)
 }

@@ -17,4 +17,17 @@ resources:
   kind: IstioAdaptiveRequestOptimizer
   path: istio-adaptive-least-request/api/v1alpha1
   version: v1alpha1
+- controller: true
+  domain: liorfranko.github.io
+  group: optimization
+  kind: Endpoint
+  version: v1alpha1
+- api:
+    crdVersion: v1
+  controller: true
+  domain: liorfranko.github.io
+  group: optimization
+  kind: WeightOptimizer
+  path: istio-adaptive-least-request/api/v1alpha1
+  version: v1alpha1
 version: "3"

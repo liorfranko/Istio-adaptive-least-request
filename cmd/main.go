@@ -20,7 +20,9 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -58,11 +60,14 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
-	var endpointsAnnotationKey string
-	var endpointPodScrapeAnnotationKey string
-	var serviceEntryLabelKey string
-	var serviceEntryServiceNameLabelKey string
+	var endpointsAnnotationKey, endpointPodScrapeAnnotationKey string
+	var serviceEntryLabelKey, serviceEntryServiceNameLabelKey string
 	var namespaces string
+	var vmdbUrl string
+	var optimizeCycleTime int
+	var minimumWeight, maximumWeight int
+	var queryInterval, stepInterval string
+	var minOptimizeCpuDistance, cpuDistanceMultiplier float64
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. "+
 		"Use the port :8080. If not set, it will be 0 in order to disable the metrics server")
@@ -79,6 +84,13 @@ func main() {
 	flag.StringVar(&serviceEntryLabelKey, "serviceentry-label", "istio.adaptive.request.optimizer/optimize", "The label to use for setting that the ServiceEntry object is optimized")
 	flag.StringVar(&serviceEntryServiceNameLabelKey, "serviceentry-service-name-label", "istio.adaptive.request.optimizer/service-name", "The label to use for setting the service name in the ServiceEntry object")
 	flag.StringVar(&namespaces, "namespaces", "", "Comma-separated list of namespaces to watch")
+	flag.StringVar(&queryInterval, "query-interval", "1m", "The time range over which to aggregate metrics when querying the VMDB service")
+	flag.StringVar(&stepInterval, "step-interval", "20s", "The granularity of the data points returned by Prometheus when querying the VMDB service")
+	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 30, "The time in seconds to run the optimization cycle")
+	flag.IntVar(&minimumWeight, "minimum-weight", 100, "The minimum weight for an endpoint to get, increasing this will make the split between the slowest and fastest endpoints smaller")
+	flag.IntVar(&maximumWeight, "maximum-weight", 600, "The maximum weight to use for the endpoints, decreasing this will make the split between the slowest and fastest endpoints smaller")
+	flag.Float64Var(&minOptimizeCpuDistance, "min-optimize-cpu-distance", 0.1, "The minimum distance between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
+	flag.Float64Var(&cpuDistanceMultiplier, "cpu-distance-multiplier", 0.1, "The multiplier to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplier)")
 
 	opts := zap.Options{
 		Development: true,
@@ -151,6 +163,37 @@ func main() {
 		NamespaceList:                   namespaceList,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IstioAdaptiveRequestOptimizer")
+		os.Exit(1)
+	}
+	//Create the channel for triggering ServiceEntry reconciliation
+	serviceEntryReconcileTriggerChannel := make(chan event.GenericEvent, 100)
+	if err = (&controller.EndpointReconciler{
+		Client:                              mgr.GetClient(),
+		Scheme:                              mgr.GetScheme(),
+		LoggerName:                          "EndpointController",
+		EndpointsAnnotationKey:              &endpointsAnnotationKey,
+		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
+		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
+		NamespaceList:                       namespaceList,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Endpoint")
+		os.Exit(1)
+	}
+	if err = (&controller.WeightOptimizerReconciler{
+		Client:                 mgr.GetClient(),
+		Scheme:                 mgr.GetScheme(),
+		LoggerName:             "WeightOptimizerController",
+		VmdbUrl:                &vmdbUrl,
+		NamespaceList:          namespaceList,
+		RequeueAfter:           time.Duration(optimizeCycleTime),
+		MaximumWeight:          maximumWeight,
+		MinimumWeight:          minimumWeight,
+		QueryInterval:          queryInterval,
+		StepInterval:           stepInterval,
+		MinOptimizeCpuDistance: minOptimizeCpuDistance,
+		CpuDistanceMultiplier:  cpuDistanceMultiplier,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WeightOptimizer")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

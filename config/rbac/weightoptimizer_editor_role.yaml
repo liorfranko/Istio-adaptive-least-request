@@ -1,0 +1,27 @@
+# permissions for end users to edit weightoptimizers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: istio-adpative-least-request
+    app.kubernetes.io/managed-by: kustomize
+  name: weightoptimizer-editor-role
+rules:
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - weightoptimizers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - weightoptimizers/status
+  verbs:
+  - get

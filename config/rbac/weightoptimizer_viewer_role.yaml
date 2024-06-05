@@ -1,0 +1,23 @@
+# permissions for end users to view weightoptimizers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: istio-adpative-least-request
+    app.kubernetes.io/managed-by: kustomize
+  name: weightoptimizer-viewer-role
+rules:
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - weightoptimizers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - weightoptimizers/status
+  verbs:
+  - get
