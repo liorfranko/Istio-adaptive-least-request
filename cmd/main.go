@@ -105,6 +105,33 @@ func main() {
 		namespaceList = strings.Split(namespaces, ",")
 	}
 
+	if newEndpointsPercentileWeight < 0 || newEndpointsPercentileWeight > 100 {
+		setupLog.Error(nil, "new-endpoints-percentile-weight must be between 0 and 100")
+		os.Exit(1)
+	}
+
+	if optimizeCycleTime < 0 || optimizeCycleTime > 360 {
+		setupLog.Error(nil, "optimize-time must be between 0 and 360")
+		os.Exit(1)
+	}
+
+	if optimizeCycleTime == 0 {
+		setupLog.Info("optimize-time is set to 0, the optimize cycle can't be disabled")
+		os.Exit(1)
+	}
+
+	_, err := time.ParseDuration(queryInterval)
+	if err != nil {
+		setupLog.Error(nil, "Invalid query interval format: %v", queryInterval)
+		return
+	}
+
+	_, err = time.ParseDuration(stepInterval)
+	if err != nil {
+		setupLog.Error(nil, "Invalid step interval format: %v", stepInterval)
+		return
+	}
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
