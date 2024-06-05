@@ -30,4 +30,9 @@ resources:
   kind: WeightOptimizer
   path: istio-adaptive-least-request/api/v1alpha1
   version: v1alpha1
+- controller: true
+  domain: liorfranko.github.io
+  group: optimization
+  kind: ServiceEntry
+  version: v1alpha1
 version: "3"

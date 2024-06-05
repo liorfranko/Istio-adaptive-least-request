@@ -20,9 +20,10 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -68,6 +69,7 @@ func main() {
 	var minimumWeight, maximumWeight int
 	var queryInterval, stepInterval string
 	var minOptimizeCpuDistance, cpuDistanceMultiplier float64
+	var newEndpointsPercentileWeight int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. "+
 		"Use the port :8080. If not set, it will be 0 in order to disable the metrics server")
@@ -91,6 +93,7 @@ func main() {
 	flag.IntVar(&maximumWeight, "maximum-weight", 600, "The maximum weight to use for the endpoints, decreasing this will make the split between the slowest and fastest endpoints smaller")
 	flag.Float64Var(&minOptimizeCpuDistance, "min-optimize-cpu-distance", 0.1, "The minimum distance between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
 	flag.Float64Var(&cpuDistanceMultiplier, "cpu-distance-multiplier", 0.1, "The multiplier to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplier)")
+	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 50, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
 
 	opts := zap.Options{
 		Development: true,
@@ -194,6 +197,20 @@ func main() {
 		CpuDistanceMultiplier:  cpuDistanceMultiplier,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WeightOptimizer")
+		os.Exit(1)
+	}
+	if err = (&controller.ServiceEntryReconciler{
+		Client:                              mgr.GetClient(),
+		Scheme:                              mgr.GetScheme(),
+		LoggerName:                          "ServiceEntryController",
+		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
+		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
+		NamespaceList:                       namespaceList,
+		NewEndpointsPercentileWeight:        newEndpointsPercentileWeight,
+		MaximumWeight:                       maximumWeight,
+		MinimumWeight:                       minimumWeight,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ServiceEntry")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

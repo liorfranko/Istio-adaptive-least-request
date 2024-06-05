@@ -1,0 +1,91 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.15.0
+  name: weightoptimizers.optimization.liorfranko.github.io
+spec:
+  group: optimization.liorfranko.github.io
+  names:
+    kind: WeightOptimizer
+    listKind: WeightOptimizerList
+    plural: weightoptimizers
+    singular: weightoptimizer
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: WeightOptimizer is the Schema for the weightoptimizers API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              endpoints:
+                items:
+                  description: Endpoint defines the desired state of Endpoint
+                  properties:
+                    alpha:
+                      type: number
+                    distance:
+                      type: number
+                    ip:
+                      type: string
+                    lastOptimized:
+                      format: date-time
+                      type: string
+                    multiplier:
+                      type: number
+                    name:
+                      type: string
+                    optimized:
+                      type: boolean
+                    responseTime:
+                      type: number
+                    serviceName:
+                      type: string
+                    serviceNamespace:
+                      type: string
+                    weight:
+                      format: int32
+                      type: integer
+                  required:
+                  - alpha
+                  - distance
+                  - ip
+                  - lastOptimized
+                  - multiplier
+                  - name
+                  - optimized
+                  - responseTime
+                  - serviceName
+                  - serviceNamespace
+                  - weight
+                  type: object
+                type: array
+            type: object
+          status:
+            description: WeightOptimizerStatus defines the observed state of WeightOptimizer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

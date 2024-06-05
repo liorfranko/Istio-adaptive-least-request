@@ -17,6 +17,16 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - services
   verbs:
   - get
@@ -72,6 +82,58 @@ rules:
   - optimization.liorfranko.github.io
   resources:
   - istioadaptiverequestoptimizers/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - serviceentries
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - serviceentries/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - serviceentries/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - weightoptimizers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - weightoptimizers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - optimization.liorfranko.github.io
+  resources:
+  - weightoptimizers/status
   verbs:
   - get
   - patch
