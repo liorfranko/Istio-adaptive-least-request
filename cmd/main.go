@@ -91,8 +91,8 @@ func main() {
 	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 30, "The time in seconds to run the optimization cycle")
 	flag.IntVar(&minimumWeight, "minimum-weight", 100, "The minimum weight for an endpoint to get, increasing this will make the split between the slowest and fastest endpoints smaller")
 	flag.IntVar(&maximumWeight, "maximum-weight", 600, "The maximum weight to use for the endpoints, decreasing this will make the split between the slowest and fastest endpoints smaller")
-	flag.Float64Var(&minOptimizeCpuDistance, "min-optimize-cpu-distance", 0.1, "The minimum distance between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
-	flag.Float64Var(&cpuDistanceMultiplier, "cpu-distance-multiplier", 0.1, "The multiplier to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplier)")
+	flag.Float64Var(&minOptimizeCpuDistance, "min-optimize-cpu-distance", 0.3, "The minimum distance between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
+	flag.Float64Var(&cpuDistanceMultiplier, "cpu-distance-multiplier", 0.03, "The multiplier to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplier)")
 	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 50, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
 
 	opts := zap.Options{
