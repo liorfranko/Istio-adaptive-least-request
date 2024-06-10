@@ -2,7 +2,7 @@ package helpers
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
-	customMetrics "istio-adaptive-least-request/metrics"
+	customMetrics "istio-adaptive-least-request/internal/metrics"
 )
 
 // ContainsString checks if a string is present in a slice of strings.

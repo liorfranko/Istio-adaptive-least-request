@@ -22,8 +22,8 @@ import (
 	"fmt"
 	"github.com/montanaflynn/stats"
 	"github.com/prometheus/client_golang/prometheus"
-	"istio-adaptive-least-request/helpers"
-	customMetrics "istio-adaptive-least-request/metrics"
+	"istio-adaptive-least-request/internal/helpers"
+	customMetrics "istio-adaptive-least-request/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
 
 	"k8s.io/apimachinery/pkg/api/errors"

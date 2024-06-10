@@ -19,8 +19,8 @@ package controller
 import (
 	"context"
 	"github.com/prometheus/client_golang/prometheus"
-	"istio-adaptive-least-request/helpers"
-	customMetrics "istio-adaptive-least-request/metrics"
+	"istio-adaptive-least-request/internal/helpers"
+	customMetrics "istio-adaptive-least-request/internal/metrics"
 	istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
