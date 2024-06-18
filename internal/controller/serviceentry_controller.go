@@ -22,8 +22,9 @@ import (
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
-	istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
-	istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	istioNetworkingV1 "istio.io/api/networking/v1"
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -94,7 +95,7 @@ func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req c
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 
 	// Fetch the specific ServiceEntry.
-	serviceEntry := istionetworkingv1beta1.ServiceEntry{}
+	serviceEntry := istioClientV1.ServiceEntry{}
 	err := r.Get(ctx, req.NamespacedName, &serviceEntry)
 	if client.IgnoreNotFound(err) != nil {
 		logger.Error(err, "Failed to fetch ServiceEntry.")
@@ -127,7 +128,7 @@ func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req c
 	averageWeight := r.CreateDefaultWeightForNewEndpoints(existingWeights)
 	logger.Info("Calculated average weight for new endpoints", "AverageWeight", averageWeight)
 	// Aggregate endpoints, assigning average weight to new ones.
-	var mergedEndpoints []*istioNetworkingV1beta1.WorkloadEntry
+	var mergedEndpoints []*istioNetworkingV1.WorkloadEntry
 	for _, subset := range endpoints.Subsets {
 		for _, address := range subset.Addresses {
 			weight, found := existingWeights[address.IP]
@@ -135,7 +136,7 @@ func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req c
 				weight = averageWeight // Assign the calculated average weight if new.
 			}
 
-			mergedEndpoints = append(mergedEndpoints, &istioNetworkingV1beta1.WorkloadEntry{
+			mergedEndpoints = append(mergedEndpoints, &istioNetworkingV1.WorkloadEntry{
 				Address: address.IP,
 				Weight:  weight,
 			})
@@ -164,7 +165,7 @@ func (r *ServiceEntryReconciler) ValidateAndUpdateWeights(ctx context.Context, r
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 
 	// Fetch the specific ServiceEntry.
-	serviceEntry := istionetworkingv1beta1.ServiceEntry{}
+	serviceEntry := istioClientV1.ServiceEntry{}
 	err := r.Get(ctx, req.NamespacedName, &serviceEntry)
 	if client.IgnoreNotFound(err) != nil {
 		logger.Error(err, "Failed to fetch ServiceEntry.")
@@ -230,7 +231,7 @@ func (r *ServiceEntryReconciler) CreateDefaultWeightForNewEndpoints(existingWeig
 	return sum / uint32(n)
 }
 
-func addressesChanged(existingEndpoints, newEndpoints []*istioNetworkingV1beta1.WorkloadEntry) bool {
+func addressesChanged(existingEndpoints, newEndpoints []*istioNetworkingV1.WorkloadEntry) bool {
 	if len(existingEndpoints) != len(newEndpoints) {
 		return true // Different number of endpoints
 	}

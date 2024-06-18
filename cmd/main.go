@@ -40,6 +40,7 @@ import (
 
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/controller"
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -52,6 +53,9 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(optimizationv1alpha1.AddToScheme(scheme))
+
+	// Register the Istio types with the scheme so that the controller can handle them
+	utilruntime.Must(istioClientV1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -68,7 +72,7 @@ func main() {
 	var optimizeCycleTime int
 	var minimumWeight, maximumWeight int
 	var queryInterval, stepInterval string
-	var minOptimizeCpuDistance, cpuDistanceMultiplier float64
+	var minOptimizeCpuDistancePercent, cpuDistanceMultiplierPercent float64
 	var newEndpointsPercentileWeight int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. "+
@@ -91,10 +95,11 @@ func main() {
 	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 30, "The time in seconds to run the optimization cycle")
 	flag.IntVar(&minimumWeight, "minimum-weight", 100, "The minimum weight for an endpoint to get, increasing this will make the split between the slowest and fastest endpoints smaller")
 	flag.IntVar(&maximumWeight, "maximum-weight", 600, "The maximum weight to use for the endpoints, decreasing this will make the split between the slowest and fastest endpoints smaller")
-	flag.Float64Var(&minOptimizeCpuDistance, "min-optimize-cpu-distance", 0.3, "The minimum distance between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
-	flag.Float64Var(&cpuDistanceMultiplier, "cpu-distance-multiplier", 0.03, "The multiplier to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplier)")
+	// Define flags with percentage names
+	flag.Float64Var(&minOptimizeCpuDistancePercent, "min-optimize-cpu-distance-percent", 2.0, "The minimum distance percentage between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
+	flag.Float64Var(&cpuDistanceMultiplierPercent, "cpu-distance-multiplier-percent", 1.0, "The multiplier percentage to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplierPercent)")
 	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 50, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
-
+	flag.StringVar(&vmdbUrl, "vmdb-url", "http://ilo-vm-single-server:8428", "The URL of the VMDB service")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -210,18 +215,18 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&controller.WeightOptimizerReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		LoggerName:             "WeightOptimizerController",
-		VmdbUrl:                &vmdbUrl,
-		NamespaceList:          namespaceList,
-		RequeueAfter:           time.Duration(optimizeCycleTime),
-		MaximumWeight:          maximumWeight,
-		MinimumWeight:          minimumWeight,
-		QueryInterval:          queryInterval,
-		StepInterval:           stepInterval,
-		MinOptimizeCpuDistance: minOptimizeCpuDistance,
-		CpuDistanceMultiplier:  cpuDistanceMultiplier,
+		Client:                        mgr.GetClient(),
+		Scheme:                        mgr.GetScheme(),
+		LoggerName:                    "WeightOptimizerController",
+		VmdbUrl:                       &vmdbUrl,
+		NamespaceList:                 namespaceList,
+		RequeueAfter:                  time.Duration(optimizeCycleTime),
+		MaximumWeight:                 maximumWeight,
+		MinimumWeight:                 minimumWeight,
+		QueryInterval:                 queryInterval,
+		StepInterval:                  stepInterval,
+		MinOptimizeCpuDistancePercent: minOptimizeCpuDistancePercent,
+		CpuDistanceMultiplierPercent:  cpuDistanceMultiplierPercent,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WeightOptimizer")
 		os.Exit(1)

@@ -39,7 +39,8 @@ import (
 	"strings"
 	"time"
 
-	istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	//istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,18 +52,18 @@ import (
 // WeightOptimizerReconciler reconciles a WeightOptimizer object
 type WeightOptimizerReconciler struct {
 	client.Client
-	Scheme                       *runtime.Scheme
-	LoggerName                   string
-	VmdbUrl                      *string
-	NamespaceList                []string
-	RequeueAfter                 time.Duration
-	MinimumWeight                int
-	MaximumWeight                int
-	NewEndpointsPercentileWeight int
-	QueryInterval                string
-	StepInterval                 string
-	MinOptimizeCpuDistance       float64
-	CpuDistanceMultiplier        float64
+	Scheme                        *runtime.Scheme
+	LoggerName                    string
+	VmdbUrl                       *string
+	NamespaceList                 []string
+	RequeueAfter                  time.Duration
+	MinimumWeight                 int
+	MaximumWeight                 int
+	NewEndpointsPercentileWeight  int
+	QueryInterval                 string
+	StepInterval                  string
+	MinOptimizeCpuDistancePercent float64
+	CpuDistanceMultiplierPercent  float64
 }
 
 type VmdbRespone struct {
@@ -143,7 +144,7 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// Fetch the ServiceEntry for the port
-		serviceEntry := istionetworkingv1beta1.ServiceEntry{}
+		serviceEntry := istionetworkingv1.ServiceEntry{}
 		err := r.Get(ctx, objectKey, &serviceEntry)
 		if err != nil {
 			// If the ServiceEntry not found, log an error and continue to the next port
@@ -449,11 +450,12 @@ func (r *WeightOptimizerReconciler) updatePodMetrics(ctx context.Context, podsMe
 			ep.CPUTime = averageCPU
 		}
 		cpuDistance := ep.CPUTime - averageCPU
-		if math.Abs(cpuDistance) < r.MinOptimizeCpuDistance {
+		if math.Abs(cpuDistance)/averageCPU < (r.MinOptimizeCpuDistancePercent / 100) {
+			logger.V(1).Info("Cpu distance is less than the minimum alpha will be 0", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "cpuDistance", cpuDistance, "cpuAlpha", ep.Alpha, "cpuMultiplier", ep.Multiplier)
 			// Don't make changes if the distance is less than the minimum
 			ep.Alpha = 0
 		} else {
-			ep.Alpha = cpuDistance * r.CpuDistanceMultiplier
+			ep.Alpha = cpuDistance * ((r.CpuDistanceMultiplierPercent / 100) / averageCPU)
 		}
 		ep.Multiplier = 1 - ep.Alpha
 		logger.V(1).Info("Updated pod metrics", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "cpuDistance", cpuDistance, "cpuAlpha", ep.Alpha, "cpuMultiplier", ep.Multiplier)
@@ -469,7 +471,7 @@ func (r *WeightOptimizerReconciler) updatePodMetrics(ctx context.Context, podsMe
 	return nil
 }
 
-func (r *WeightOptimizerReconciler) getServiceEntryWeightMap(serviceEntry *istionetworkingv1beta1.ServiceEntry) (map[string]uint32, error) {
+func (r *WeightOptimizerReconciler) getServiceEntryWeightMap(serviceEntry *istionetworkingv1.ServiceEntry) (map[string]uint32, error) {
 	// Change it to return a map of WorkloadEntry
 
 	weightsMap := make(map[string]uint32)

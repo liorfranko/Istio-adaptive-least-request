@@ -23,8 +23,10 @@ import (
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
-	istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
-	istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	//istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
+	//istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	istioNetworkingV1 "istio.io/api/networking/v1"
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -113,7 +115,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 
 	portsToProcess := r.collectPortsToProcess(optimizer, service)
 	logger.V(1).Info("Ports to process", "Ports", portsToProcess)
-	var createdServiceEntries []*istioClientV1beta1.ServiceEntry
+	var createdServiceEntries []*istioClientV1.ServiceEntry
 	for _, port := range portsToProcess {
 		// Assume createServiceEntry returns a pointer to a ServiceEntry and error
 		serviceEntry, err := r.createServiceEntry(ctx, service, port, endpoints.Subsets, *optimizer)
@@ -133,8 +135,8 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
-func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context.Context, namespace, name string) *istioClientV1beta1.ServiceEntry {
-	var serviceEntry istioClientV1beta1.ServiceEntry
+func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context.Context, namespace, name string) *istioClientV1.ServiceEntry {
+	var serviceEntry istioClientV1.ServiceEntry
 	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, &serviceEntry)
 	if err != nil {
 		return nil
@@ -144,14 +146,14 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context
 
 // createServiceEntry constructs a ServiceEntry resource based on the provided Service and ServicePort.
 // It then creates the ServiceEntry in the Kubernetes API server.
-func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, subsets []corev1.EndpointSubset, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1beta1.ServiceEntry, error) {
+func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, subsets []corev1.EndpointSubset, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1.ServiceEntry, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	host := fmt.Sprintf("%s.%s.svc.cluster.local", service.Name, service.Namespace)
 
-	var serviceEntryEndpoints []*istioNetworkingV1beta1.WorkloadEntry
+	var serviceEntryEndpoints []*istioNetworkingV1.WorkloadEntry
 	for _, subset := range subsets {
 		for _, address := range subset.Addresses {
-			serviceEndpoint := &istioNetworkingV1beta1.WorkloadEntry{
+			serviceEndpoint := &istioNetworkingV1.WorkloadEntry{
 				Address: address.IP,
 				Weight:  DefaultWeightForNewEndpoints,
 			}
@@ -160,9 +162,9 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 	}
 
 	// Construct the ServiceEntry resource
-	serviceEntry := &istioClientV1beta1.ServiceEntry{
+	serviceEntry := &istioClientV1.ServiceEntry{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: "networking.istio.io/v1beta1",
+			APIVersion: "networking.istio.io/v1",
 			Kind:       "ServiceEntry",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -181,9 +183,9 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 				},
 			},
 		},
-		Spec: istioNetworkingV1beta1.ServiceEntry{
+		Spec: istioNetworkingV1.ServiceEntry{
 			Hosts: []string{host},
-			Ports: []*istioNetworkingV1beta1.ServicePort{
+			Ports: []*istioNetworkingV1.ServicePort{
 				{
 					Number:   uint32(port.Port),
 					Protocol: helpers.SafeDereferenceAppProtocol(port.AppProtocol),
@@ -191,8 +193,8 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 				},
 			},
 			Endpoints:  serviceEntryEndpoints,
-			Location:   istioNetworkingV1beta1.ServiceEntry_MESH_INTERNAL,
-			Resolution: istioNetworkingV1beta1.ServiceEntry_STATIC,
+			Location:   istioNetworkingV1.ServiceEntry_MESH_INTERNAL,
+			Resolution: istioNetworkingV1.ServiceEntry_STATIC,
 		},
 	}
 
@@ -427,7 +429,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificPodAnnotations(
 	return nil
 }
 
-func (r *IstioAdaptiveRequestOptimizerReconciler) updateOptimizerStatus(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntries []*istioClientV1beta1.ServiceEntry) error {
+func (r *IstioAdaptiveRequestOptimizerReconciler) updateOptimizerStatus(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntries []*istioClientV1.ServiceEntry) error {
 	var statusEntries []optimizationv1alpha1.ServiceEntry
 	for _, serviceEntry := range serviceEntries {
 		statusEntries = append(statusEntries, optimizationv1alpha1.ServiceEntry{

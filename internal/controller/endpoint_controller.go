@@ -21,7 +21,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
-	istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	//istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -63,7 +64,7 @@ func (r *EndpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	logger.V(1).Info("Endpoints fetched", "Subsets", endpoints.Subsets)
 
-	var serviceEntry istioClientV1beta1.ServiceEntryList
+	var serviceEntry istioClientV1.ServiceEntryList
 	labelKey := *r.ServiceEntryServiceNameLabelKey
 	if err := r.List(ctx, &serviceEntry, client.InNamespace(req.Namespace), client.MatchingLabels{labelKey: endpoints.Name}); err != nil {
 		logger.Error(err, "Failed to list ServiceEntry", "Namespace", req.Namespace, "Name", req.Name)
@@ -78,7 +79,7 @@ func (r *EndpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 		// Trigger reconciliation for ServiceEntry if differences are found
 		r.ServiceEntryReconcileTriggerChannel <- event.GenericEvent{
-			Object: &istioClientV1beta1.ServiceEntry{
+			Object: &istioClientV1.ServiceEntry{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      se.Name,
 					Namespace: se.Namespace,
