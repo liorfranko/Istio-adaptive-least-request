@@ -12,7 +12,7 @@ spec:
     listKind: WeightOptimizerList
     plural: weightoptimizers
     singular: weightoptimizer
-  scope: Cluster
+  scope: Namespaced
   versions:
   - name: v1alpha1
     schema:

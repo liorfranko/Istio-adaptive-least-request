@@ -47,7 +47,7 @@ type WeightOptimizerStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:resource:scope=Namespaced
 
 // WeightOptimizer is the Schema for the weightoptimizers API
 type WeightOptimizer struct {

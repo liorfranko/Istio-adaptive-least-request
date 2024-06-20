@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/helpers"
@@ -251,16 +252,26 @@ func addressesChanged(existingEndpoints, newEndpoints []*istioNetworkingV1.Workl
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *ServiceEntryReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *ServiceEntryReconciler) SetupWithManager(mgr ctrl.Manager, logger logr.Logger) error {
 	namespacePredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			return helpers.NamespaceInFilteredList(e.Object.GetNamespace(), r.NamespaceList)
+			//logger.Info("Create event received", "object", e.Object)
+			namespace := e.Object.GetNamespace()
+			//logger.Info("Create event for namespace", "namespace", namespace)
+			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
+			//logger.Info("Namespace in list", "inList", inList)
+			return inList
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			return false
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return helpers.NamespaceInFilteredList(e.ObjectNew.GetNamespace(), r.NamespaceList)
+			//logger.Info("Update event received", "old object", e.ObjectOld, "new object", e.ObjectNew)
+			namespace := e.ObjectNew.GetNamespace()
+			//logger.Info("Update event for namespace", "namespace", namespace)
+			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
+			//logger.Info("Namespace in list", "inList", inList)
+			return inList
 		},
 	}
 

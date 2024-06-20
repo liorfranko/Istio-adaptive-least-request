@@ -25,7 +25,6 @@ import (
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
-
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -402,7 +401,6 @@ func (r *WeightOptimizerReconciler) resetWeights(ctx context.Context, weightOpti
 
 func (r *WeightOptimizerReconciler) ensureWeightOptimizer(ctx context.Context, istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, objectKey client.ObjectKey, serviceEntryWeightsMap map[string]uint32) (*optimizationv1alpha1.WeightOptimizer, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-
 	// Fetch the WeightOptimizer for the port
 	weightOptimizer := &optimizationv1alpha1.WeightOptimizer{}
 	err := r.Get(ctx, objectKey, weightOptimizer)
