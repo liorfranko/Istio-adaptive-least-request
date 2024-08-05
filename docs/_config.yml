@@ -28,8 +28,8 @@ description: >- # this means to ignore newlines until "baseurl:"
   load balancing weights based on CPU usage metrics, and the significant 
   performance improvements achieved. The article concludes with insights on 
   community collaboration and plans for further enhancements.
-baseurl: "/istio-adaptive-least-request" # the subpath of your site, e.g. /blog
-url: "https://liorfranko.github.io" # the base hostname & protocol for your site, e.g. http://example.com
+baseurl: "" # the subpath of your site, e.g. /blog
+url: "https://liorfranko.github.io/Istio-adaptive-least-request" # the base hostname & protocol for your site, e.g. http://example.com
 github_username:  liorfranko
 
 # Build settings
