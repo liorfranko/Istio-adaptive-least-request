@@ -63,6 +63,7 @@ type WeightOptimizerReconciler struct {
 	StepInterval                  string
 	MinOptimizeCpuDistancePercent float64
 	CpuDistanceMultiplierPercent  float64
+	ScalingFactor                 float64
 }
 
 type VmdbRespone struct {
@@ -175,7 +176,7 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Error(err, "Failed to list Pods", "Namespace", istioOptimizer.Namespace)
 			return ctrl.Result{}, err
 		}
-		logger.V(1).Info("Pods fetched", "Pods", podsInfo)
+		//logger.V(1).Info("Pods fetched", "Pods", podsInfo)
 		// Get the metrics from VictoriaMetrics for the service and protocol
 		podsMetrics, err := r.getPodMetrics(ctx, istioOptimizer.Name, istioOptimizer.Namespace, podsInfo)
 		if err != nil {
@@ -703,7 +704,12 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 		if ep.CPUTime != 0.0 {
 			cpuTimes = append(cpuTimes, ep.CPUTime)
 		}
-		logger.V(1).Info("Collected Pod metrics", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime, "Weight", serviceEntryWeightsMap[ep.PodName])
+		logger.V(1).Info("Collected Pod metrics", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime)
+	}
+	// If totalWeight is less than pods * (MinimumWeight), then multiply totalWeight with the maximum weights * number of pods. use len of cpu time
+	if totalWeight < float64(len(cpuTimes))*float64(r.MinimumWeight) {
+		totalWeight = float64(len(cpuTimes)) * float64(r.MaximumWeight) * 2
+		logger.V(1).Info("Total weight is less than minimum, setting it to 2 times the maximum weight * number of pods", "newTotalWeight", totalWeight, "minimumWeight", float64(len(cpuTimes))*float64(r.MinimumWeight), "maximumWeight", r.MaximumWeight, "number of pods", len(cpuTimes))
 	}
 	averageCPU, _ := stats.Mean(cpuTimes)
 	logger.V(1).Info("averageCPU", "averageCPU", averageCPU)
@@ -717,16 +723,57 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 	}
 
 	// Scaling factor for less aggressive changes
-	scalingFactor := 0.25
+	scalingFactor := r.ScalingFactor
+
+	// Calculate average total weight based on the number of entries in the serviceEntryWeightsMap
+	avgTotalWeight := totalWeight / float64(len(serviceEntryWeightsMap))
 
 	// Redistribute weights and estimate new CPU times
 	EstimatedCpuTimes := make(map[string]float64)
 	for _, ep := range *podsMetrics {
-		if ep.CPUTime != 0.0 {
+		logger.V(1).Info("Processing Pod metrics", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime, "Weight", serviceEntryWeightsMap[ep.PodAddress])
+		if ep.CPUTime == 0.0 {
+			// Pods without CPU metrics will have the averageCPU, and are not optimized
+			logger.Info("CPU time is 0.0, setting estimated CPU time to averageCPU", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "averageCPU", averageCPU)
+			EstimatedCpuTimes[ep.PodAddress], _ = stats.Max(cpuTimes)
+		}
+		// Skip endpoints without CPU metrics, endpoint with cpu time 0.0 will be set to averageCPU
+		if ep.CPUTime > 0.0 {
 			// Calculate new share and adjusted weight
 			newShare := (averageCPU / ep.CPUTime) * float64(serviceEntryWeightsMap[ep.PodAddress]) / X_sum * totalWeight
 			currentWeight := float64(serviceEntryWeightsMap[ep.PodAddress])
 			adjustedWeight := currentWeight + scalingFactor*(newShare-currentWeight)
+			// Avoid huge spikes by limiting weight changes
+			// Calculate the distance between adjustedWeight and currentWeight, and the limit for adjustment
+			distance := adjustedWeight - currentWeight
+			maxAllowedDistance := avgTotalWeight / 2
+
+			// If the distance exceeds the limit, cap the adjusted weight
+			if distance > maxAllowedDistance {
+				logger.V(1).Info("Distance exceeds the allowable limit, adjusting weight",
+					"PodName", ep.PodName,
+					"PodAddress", ep.PodAddress,
+					"CurrentWeight", currentWeight,
+					"AdjustedWeight", adjustedWeight,
+					"Distance", distance,
+					"MaxAllowedDistance", maxAllowedDistance)
+
+				// Limit the adjusted weight to avoid large spikes
+				adjustedWeight = currentWeight + maxAllowedDistance
+
+				logger.V(1).Info("New adjusted weight set",
+					"PodName", ep.PodName,
+					"PodAddress", ep.PodAddress,
+					"NewAdjustedWeight", adjustedWeight)
+			}
+
+			// Log final adjusted weight before updating the map
+			//logger.V(1).Info("Updating service entry with final adjusted weight",
+			//	"PodName", ep.PodName,
+			//	"PodAddress", ep.PodAddress,
+			//	"FinalAdjustedWeight", adjustedWeight)
+
+			// Update the service entry weights map with the new adjusted weight
 			serviceEntryWeightsMap[ep.PodAddress] = uint32(adjustedWeight)
 
 			// Estimate new CPU time based on the adjusted weight
