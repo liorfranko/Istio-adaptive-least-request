@@ -142,7 +142,6 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Name:      fmt.Sprintf("%s-%d", istioOptimizer.Name, servicePort.Number),
 			Namespace: istioOptimizer.Namespace,
 		}
-
 		// Fetch the ServiceEntry for the port
 		serviceEntry := istionetworkingv1.ServiceEntry{}
 		err := r.Get(ctx, objectKey, &serviceEntry)
@@ -698,6 +697,17 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 	}
 	logger.V(1).Info("Total weight", "totalWeight", totalWeight)
 
+	// If totalWeight is less than pods * (MinimumWeight), then multiply totalWeight with the maximum weights * number of pods. use len of cpu time
+	if totalWeight < float64(len(serviceEntryWeightsMap))*float64(r.MinimumWeight) {
+		logger.Info("Total weight is less than minimum, setting it to 10 times current weights", "TotalWeight", totalWeight, "minimumWeight", float64(len(serviceEntryWeightsMap))*float64(r.MinimumWeight), "number of pods", len(serviceEntryWeightsMap))
+		for ep, weight := range serviceEntryWeightsMap {
+			// Update the service entry weights map with the new adjusted weight
+			serviceEntryWeightsMap[ep] = uint32(weight) * 10
+		}
+		// return the updated serviceEntryWeightsMap
+		return serviceEntryWeightsMap, nil
+	}
+
 	// Calculate average CPU time
 	var cpuTimes []float64
 	for _, ep := range *podsMetrics {
@@ -705,11 +715,6 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 			cpuTimes = append(cpuTimes, ep.CPUTime)
 		}
 		logger.V(1).Info("Collected Pod metrics", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime)
-	}
-	// If totalWeight is less than pods * (MinimumWeight), then multiply totalWeight with the maximum weights * number of pods. use len of cpu time
-	if totalWeight < float64(len(cpuTimes))*float64(r.MinimumWeight) {
-		totalWeight = float64(len(cpuTimes)) * float64(r.MaximumWeight) * 2
-		logger.V(1).Info("Total weight is less than minimum, setting it to 2 times the maximum weight * number of pods", "newTotalWeight", totalWeight, "minimumWeight", float64(len(cpuTimes))*float64(r.MinimumWeight), "maximumWeight", r.MaximumWeight, "number of pods", len(cpuTimes))
 	}
 	averageCPU, _ := stats.Mean(cpuTimes)
 	logger.V(1).Info("averageCPU", "averageCPU", averageCPU)
@@ -746,7 +751,7 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 			// Avoid huge spikes by limiting weight changes
 			// Calculate the distance between adjustedWeight and currentWeight, and the limit for adjustment
 			distance := adjustedWeight - currentWeight
-			maxAllowedDistance := avgTotalWeight / 2
+			maxAllowedDistance := avgTotalWeight / 4
 
 			// If the distance exceeds the limit, cap the adjusted weight
 			if distance > maxAllowedDistance {
@@ -767,13 +772,12 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 					"NewAdjustedWeight", adjustedWeight)
 			}
 
-			// Log final adjusted weight before updating the map
-			//logger.V(1).Info("Updating service entry with final adjusted weight",
-			//	"PodName", ep.PodName,
-			//	"PodAddress", ep.PodAddress,
-			//	"FinalAdjustedWeight", adjustedWeight)
-
-			// Update the service entry weights map with the new adjusted weight
+			//Log final adjusted weight before updating the map
+			logger.V(1).Info("Updating service entry with final adjusted weight",
+				"PodName", ep.PodName,
+				"PodAddress", ep.PodAddress,
+				"FinalAdjustedWeight", adjustedWeight)
+			//Update the service entry weights map with the new adjusted weight
 			serviceEntryWeightsMap[ep.PodAddress] = uint32(adjustedWeight)
 
 			// Estimate new CPU time based on the adjusted weight
