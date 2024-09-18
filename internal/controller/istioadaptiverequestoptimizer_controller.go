@@ -23,6 +23,8 @@ import (
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	//istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
 	//istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istioNetworkingV1 "istio.io/api/networking/v1"
@@ -144,6 +146,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context
 	return &serviceEntry
 }
 
+// TargetPort is optional and defaults to the port value
 // createServiceEntry constructs a ServiceEntry resource based on the provided Service and ServicePort.
 // It then creates the ServiceEntry in the Kubernetes API server.
 func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, subsets []corev1.EndpointSubset, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1.ServiceEntry, error) {
@@ -159,6 +162,13 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 			}
 			serviceEntryEndpoints = append(serviceEntryEndpoints, serviceEndpoint)
 		}
+	}
+	// Create the ServicePort for ServiceEntry
+	servicePort := &istioNetworkingV1.ServicePort{
+		Number:     uint32(port.Port),
+		Protocol:   helpers.SafeDereferenceAppProtocol(port.AppProtocol),
+		Name:       port.Name,
+		TargetPort: uint32(port.TargetPort.IntVal),
 	}
 
 	// Construct the ServiceEntry resource
@@ -186,12 +196,9 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 		Spec: istioNetworkingV1.ServiceEntry{
 			Hosts: []string{host},
 			Ports: []*istioNetworkingV1.ServicePort{
-				{
-					Number:   uint32(port.Port),
-					Protocol: helpers.SafeDereferenceAppProtocol(port.AppProtocol),
-					Name:     port.Name,
-				},
+				servicePort,
 			},
+
 			Endpoints:  serviceEntryEndpoints,
 			Location:   istioNetworkingV1.ServiceEntry_MESH_INTERNAL,
 			Resolution: istioNetworkingV1.ServiceEntry_STATIC,
@@ -279,19 +286,25 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) collectPortsToProcess(optimize
 	var portsToProcess []corev1.ServicePort
 	// TODO log and add a metric when the user add a port that does not exist in the service
 	if len(optimizer.Spec.ServicePorts) > 0 {
-		optimizerPortsMap := make(map[string]bool)
+		optimizerPortsMap := make(map[string]optimizationv1alpha1.ServicePort)
 		for _, optimizerPort := range optimizer.Spec.ServicePorts {
 			// Normalize protocol to "TCP" for "HTTP" and "gRPC"
 			normalizedProtocol := normalizeProtocol(optimizerPort.Protocol)
 			portProtocolKey := fmt.Sprintf("%d/%s", optimizerPort.Number, normalizedProtocol)
-			optimizerPortsMap[portProtocolKey] = true
+			optimizerPortsMap[portProtocolKey] = optimizerPort
 		}
 
 		for _, servicePort := range service.Spec.Ports {
 			// Ensure service port protocol is compared in a normalized form
 			normalizedServiceProtocol := normalizeProtocol(string(servicePort.Protocol))
 			portProtocolKey := fmt.Sprintf("%d/%s", servicePort.Port, normalizedServiceProtocol)
-			if _, exists := optimizerPortsMap[portProtocolKey]; exists {
+			// Check if the service port matches an optimizer port
+			if optimizerPort, exists := optimizerPortsMap[portProtocolKey]; exists {
+				// If the optimizer port specifies a TargetPort, use it
+				if optimizerPort.TargetPort > 0 {
+					servicePort.TargetPort = intstr.FromInt(int(optimizerPort.TargetPort))
+				}
+				// Add the modified service port to the list of ports to process
 				portsToProcess = append(portsToProcess, servicePort)
 			}
 		}

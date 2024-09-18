@@ -719,6 +719,20 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 	averageCPU, _ := stats.Mean(cpuTimes)
 	logger.V(1).Info("averageCPU", "averageCPU", averageCPU)
 
+	// if the averageCPU is less than 0.20 then we don't have enough data to optimize
+	if averageCPU < 0.20 {
+		logger.Info("averageCPU is less than 0.20, not enough data to optimize", "averageCPU", averageCPU)
+		// reset all weights to maximum
+		for ep, _ := range serviceEntryWeightsMap {
+			if uint32(r.MaximumWeight) != serviceEntryWeightsMap[ep] {
+				// Update the service entry weights map with the new adjusted weight
+				serviceEntryWeightsMap[ep] = uint32(r.MaximumWeight)
+			}
+		}
+		// return the updated serviceEntryWeightsMap
+		return serviceEntryWeightsMap, nil
+	}
+
 	// Calculate X_sum
 	var X_sum float64
 	for _, ep := range *podsMetrics {
