@@ -65,9 +65,18 @@ var (
 		},
 		[]string{"controller", "type", "name", "namespace"}, // Differentiate by error type and associated service details
 	)
+
+	// QueryLatencyMetric tracks the time it takes to get a response from VictoriaMetrics for a service.
+	QueryLatencyMetric = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "query_latency",
+			Help: "Time to get response from VictoriaMetrics for a service in seconds.",
+		},
+		[]string{"service_name", "service_namespace"}, // Label by service name and namespace
+	)
 )
 
 func init() {
 	// Register custom metrics with Prometheus's default registry
-	metrics.Registry.MustRegister(AlphaMetric, DistanceMetric, MultiplierMetric, ResponseTimeMetric, WeightMetric, NormalizedWeightMetric, ErrorMetrics)
+	metrics.Registry.MustRegister(AlphaMetric, DistanceMetric, MultiplierMetric, ResponseTimeMetric, WeightMetric, NormalizedWeightMetric, ErrorMetrics, QueryLatencyMetric)
 }

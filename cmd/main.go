@@ -38,9 +38,10 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
+
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/controller"
-	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -204,10 +205,10 @@ func main() {
 	}
 	//Create the channel for triggering ServiceEntry reconciliation
 	serviceEntryReconcileTriggerChannel := make(chan event.GenericEvent, 100)
-	if err = (&controller.EndpointReconciler{
+	if err = (&controller.EndpointSliceReconciler{
 		Client:                              mgr.GetClient(),
 		Scheme:                              mgr.GetScheme(),
-		LoggerName:                          "EndpointController",
+		LoggerName:                          "EndpointSliceController",
 		EndpointsAnnotationKey:              &endpointsAnnotationKey,
 		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
 		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
@@ -246,6 +247,13 @@ func main() {
 		MinimumWeight:                       minimumWeight,
 	}).SetupWithManager(mgr, setupLog); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ServiceEntry")
+		os.Exit(1)
+	}
+	if err = (&controller.EndpointSliceReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EndpointSlice")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

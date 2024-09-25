@@ -270,10 +270,19 @@ func (r *WeightOptimizerReconciler) getCPUMetrics(ctx context.Context, service s
 	queryPattern := fmt.Sprintf(`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s])) by (pod)`, namespace, service, r.QueryInterval)
 	logger.V(1).Info("queryPattern", "queryPattern", queryPattern)
 	query := url.QueryEscape(queryPattern)
+	// Start timer
+	startTime := time.Now()
 	CpuTime, err := r.getVMCPUQueryMetric(ctx, query)
 	if err != nil {
 		return map[string]*PodCPUMetrics{}, err
 	}
+	// Measure elapsed time
+	elapsedTime := time.Since(startTime).Seconds() // in seconds
+	queryLabels := prometheus.Labels{
+		"service_name":      service,
+		"service_namespace": namespace,
+	}
+	customMetrics.QueryLatencyMetric.With(queryLabels).Set(elapsedTime)
 	// Then process the response to return a slice of `PodMetrics`. Assume `response` is what you got from VictoriaMetrics.
 	podCPUMetrics := make(map[string]*PodCPUMetrics)
 	for _, v := range CpuTime.Data.Result {
@@ -801,7 +810,7 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 				logger.Info("New weight and CPU time", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "NewWeight", adjustedWeight, "EstimatedCpuTime", EstimatedCpuTime)
 			} else {
 				EstimatedCpuTimes[ep.PodAddress] = ep.CPUTime
-				logger.Info("Adjusted weight is zero, keeping original CPU time", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime)
+				logger.Info("Adjusted weight is zero, keeping weight", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime, "Weight", currentWeight)
 			}
 		}
 	}
