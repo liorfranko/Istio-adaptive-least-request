@@ -45,8 +45,6 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers/finalizers,verbs=update
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=core,resources=endpoints,verbs=update;patch;get;list;watch
-//TODO: deprecating endpoints in favor of endpoint slices
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/finalizers,verbs=update

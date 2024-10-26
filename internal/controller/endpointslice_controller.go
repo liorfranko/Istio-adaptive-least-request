@@ -109,7 +109,6 @@ func addressesEqual(a, b map[string]struct{}) bool {
 func (r *EndpointSliceReconciler) checkNamespaceAndAnnotation(obj client.Object) bool {
 	if r.EndpointsAnnotationKey == nil {
 		// Optionally log a warning
-		//log.Log.V(1).Info("EndpointsAnnotationKey is not set, skipping annotation check")
 		return false
 	}
 	annotationKey := *r.EndpointsAnnotationKey

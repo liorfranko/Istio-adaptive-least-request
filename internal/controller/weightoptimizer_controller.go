@@ -38,7 +38,6 @@ import (
 	"strings"
 	"time"
 
-	//istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -169,13 +168,11 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// create a map of pod ips and their names from pods ips
 		// Fetch pods using the selector
-		// C
 		podsInfo, err := r.listPods(ctx, istioOptimizer.Namespace, labels.SelectorFromSet(serviceEntry.Spec.Endpoints[0].Labels))
 		if err != nil {
 			logger.Error(err, "Failed to list Pods", "Namespace", istioOptimizer.Namespace)
 			return ctrl.Result{}, err
 		}
-		//logger.V(1).Info("Pods fetched", "Pods", podsInfo)
 		// Get the metrics from VictoriaMetrics for the service and protocol
 		podsMetrics, err := r.getPodMetrics(ctx, istioOptimizer.Name, istioOptimizer.Namespace, podsInfo)
 		if err != nil {
@@ -682,7 +679,6 @@ func (r *WeightOptimizerReconciler) calculateNewWeight(currentWeight uint32, mul
 }
 
 func (r *WeightOptimizerReconciler) updateMetrics(weightOptimizer *optimizationv1alpha1.WeightOptimizer, totalWeight float64) {
-	// logger.Info("Updating Prometheus metrics", "ServiceEntry", serviceEntry.Name, "IP", ep.IP, "ServiceName", ep.WeightOptimizer.ServiceName, "ServiceNamespace", ep.WeightOptimizer.ServiceNamespace)
 	for _, ep := range weightOptimizer.Spec.Endpoints {
 		customMetrics.AlphaMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.Alpha)
 		customMetrics.DistanceMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.Distance)

@@ -80,7 +80,6 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Step 3: Validate that the endpoints in the ServiceEntry match the current cluster state
-	//serviceEntryUpdated, validationErr := r.ValidateAndUpdateWeights(ctx, req, opt)
 	_, validationErr := r.ValidateAndUpdateWeights(ctx, req, opt)
 	if validationErr != nil {
 		logger.Error(validationErr, "Failed to validate or update weights.")
@@ -177,76 +176,6 @@ func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req c
 	return ctrl.Result{}, nil
 }
 
-//// HandleEndpointUpdate checks for changes in the Endpoints and updates the ServiceEntry if necessary.
-//func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-//	logger := log.FromContext(ctx).WithName(r.LoggerName)
-//
-//	// Fetch the specific ServiceEntry.
-//	serviceEntry := istioClientV1.ServiceEntry{}
-//	err := r.Get(ctx, req.NamespacedName, &serviceEntry)
-//	if client.IgnoreNotFound(err) != nil {
-//		logger.Error(err, "Failed to fetch ServiceEntry.")
-//		return ctrl.Result{}, err
-//	}
-//
-//	// Extract the original service name from the ServiceEntry's labels.
-//	originalServiceName := serviceEntry.Labels[*r.ServiceEntryServiceNameLabelKey]
-//	if originalServiceName == "" {
-//		logger.Error(nil, "ServiceEntry does not contain the expected label.", "Label", *r.ServiceEntryServiceNameLabelKey)
-//		return ctrl.Result{}, nil // or an error, as appropriate
-//	}
-//
-//	// Construct the NamespacedName for the Endpoints object, assuming it's in the same namespace.
-//	endpointsNamespacedName := types.NamespacedName{Namespace: req.Namespace, Name: originalServiceName}
-//
-//	// Fetch the corresponding Endpoints object.
-//	endpoints := &corev1.Endpoints{}
-//	if err := r.Get(ctx, endpointsNamespacedName, endpoints); err != nil {
-//		logger.Error(err, "Failed to fetch Endpoints for service", "Namespace", endpointsNamespacedName.Namespace, "Name", endpointsNamespacedName.Name)
-//		return ctrl.Result{}, err
-//	}
-//	// Track existing endpoint weights.
-//	existingWeights := map[string]uint32{}
-//	for _, ep := range serviceEntry.Spec.Endpoints {
-//		existingWeights[ep.Address] = ep.Weight
-//	}
-//
-//	// Calculate average weight for new endpoints.
-//	averageWeight := r.CreateDefaultWeightForNewEndpoints(existingWeights)
-//	logger.Info("Calculated average weight for new endpoints", "AverageWeight", averageWeight)
-//	// Aggregate endpoints, assigning average weight to new ones.
-//	var mergedEndpoints []*istioNetworkingV1.WorkloadEntry
-//	for _, subset := range endpoints.Subsets {
-//		for _, address := range subset.Addresses {
-//			weight, found := existingWeights[address.IP]
-//			if !found {
-//				weight = averageWeight // Assign the calculated average weight if new.
-//			}
-//
-//			mergedEndpoints = append(mergedEndpoints, &istioNetworkingV1.WorkloadEntry{
-//				Address: address.IP,
-//				Weight:  weight,
-//			})
-//		}
-//	}
-//
-//	// Check if updates are required based on endpoint changes.
-//	if !addressesChanged(serviceEntry.Spec.Endpoints, mergedEndpoints) {
-//		logger.Info("No endpoint changes detected", "ServiceEntry", serviceEntry.Name)
-//		return ctrl.Result{}, nil // No changes, no need to update.
-//	}
-//	logger.Info("Detected endpoint changes", "ServiceEntry", serviceEntry.Name)
-//	// Update the ServiceEntry with the newly merged endpoints.
-//	serviceEntry.Spec.Endpoints = mergedEndpoints
-//	if err := r.Update(ctx, &serviceEntry); err != nil {
-//		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
-//		return ctrl.Result{}, nil // or an error, as appropriate
-//	}
-//
-//	logger.Info("ServiceEntry updated successfully with dynamic weighting", "ServiceEntry", serviceEntry.Name)
-//	return ctrl.Result{}, nil
-//}
-
 // ValidateAndUpdateWeights checks if endpoints match the expected state and updates weights if necessary.
 func (r *ServiceEntryReconciler) ValidateAndUpdateWeights(ctx context.Context, req ctrl.Request, optWeight *optimizationv1alpha1.WeightOptimizer) (bool, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
@@ -341,22 +270,16 @@ func addressesChanged(existingEndpoints, newEndpoints []*istioNetworkingV1.Workl
 func (r *ServiceEntryReconciler) SetupWithManager(mgr ctrl.Manager, logger logr.Logger) error {
 	namespacePredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			//logger.Info("Create event received", "object", e.Object)
 			namespace := e.Object.GetNamespace()
-			//logger.Info("Create event for namespace", "namespace", namespace)
 			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
-			//logger.Info("Namespace in list", "inList", inList)
 			return inList
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			return false
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			//logger.Info("Update event received", "old object", e.ObjectOld, "new object", e.ObjectNew)
 			namespace := e.ObjectNew.GetNamespace()
-			//logger.Info("Update event for namespace", "namespace", namespace)
 			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
-			//logger.Info("Namespace in list", "inList", inList)
 			return inList
 		},
 	}
