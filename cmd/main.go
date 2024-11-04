@@ -38,9 +38,10 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
+
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/controller"
-	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -74,8 +75,9 @@ func main() {
 	var queryInterval, stepInterval string
 	var minOptimizeCpuDistancePercent, cpuDistanceMultiplierPercent float64
 	var newEndpointsPercentileWeight int
+	var scalingFactor float64
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. "+
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to. "+
 		"Use the port :8080. If not set, it will be 0 in order to disable the metrics server")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -98,7 +100,8 @@ func main() {
 	// Define flags with percentage names
 	flag.Float64Var(&minOptimizeCpuDistancePercent, "min-optimize-cpu-distance-percent", 5.0, "The minimum distance percentage between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
 	flag.Float64Var(&cpuDistanceMultiplierPercent, "cpu-distance-multiplier-percent", 1.0, "The multiplier percentage to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplierPercent)")
-	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 50, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
+	flag.Float64Var(&scalingFactor, "scaling-factor", 0.15, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scalingFactor")
+	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 10, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
 	flag.StringVar(&vmdbUrl, "vmdb-url", "http://ilo-vm-single-server:8428", "The URL of the VMDB service")
 	opts := zap.Options{
 		Development: true,
@@ -202,10 +205,10 @@ func main() {
 	}
 	//Create the channel for triggering ServiceEntry reconciliation
 	serviceEntryReconcileTriggerChannel := make(chan event.GenericEvent, 100)
-	if err = (&controller.EndpointReconciler{
+	if err = (&controller.EndpointSliceReconciler{
 		Client:                              mgr.GetClient(),
 		Scheme:                              mgr.GetScheme(),
-		LoggerName:                          "EndpointController",
+		LoggerName:                          "EndpointSliceController",
 		EndpointsAnnotationKey:              &endpointsAnnotationKey,
 		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
 		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
@@ -227,6 +230,7 @@ func main() {
 		StepInterval:                  stepInterval,
 		MinOptimizeCpuDistancePercent: minOptimizeCpuDistancePercent,
 		CpuDistanceMultiplierPercent:  cpuDistanceMultiplierPercent,
+		ScalingFactor:                 scalingFactor,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WeightOptimizer")
 		os.Exit(1)
@@ -243,6 +247,13 @@ func main() {
 		MinimumWeight:                       minimumWeight,
 	}).SetupWithManager(mgr, setupLog); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ServiceEntry")
+		os.Exit(1)
+	}
+	if err = (&controller.EndpointSliceReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EndpointSlice")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

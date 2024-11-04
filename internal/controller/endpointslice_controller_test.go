@@ -20,7 +20,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("Endpoint Controller", func() {
+var _ = Describe("EndpointSlice Controller", func() {
 	Context("When reconciling a resource", func() {
 
 		It("should successfully reconcile the resource", func() {

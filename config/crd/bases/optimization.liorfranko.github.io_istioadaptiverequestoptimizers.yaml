@@ -67,6 +67,10 @@ spec:
                       - http
                       - grpc
                       type: string
+                    targetPort:
+                      description: TargetPort is the target port number of the service.
+                      format: int32
+                      type: integer
                   required:
                   - number
                   - protocol
