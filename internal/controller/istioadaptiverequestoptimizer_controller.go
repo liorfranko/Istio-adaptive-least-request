@@ -1,43 +1,26 @@
-/*
-Copyright 2024.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/runtime"
+	"strings"
+
 	"github.com/prometheus/client_golang/prometheus"
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	//istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
-	//istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"strings"
-	_ "strings"
 )
 
 const istioAdaptiveRequestOptimizerFinalizer = "optimization.liorfranko.github.io/finalizer"
@@ -61,7 +44,7 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers/finalizers,verbs=update
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=core,resources=endpoints,verbs=update;patch;get;list;watch
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/finalizers,verbs=update
@@ -104,23 +87,30 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 		return ctrl.Result{}, err
 	}
 	logger.V(1).Info("Service fetched", "Service", service)
-	// Fetch the Endpoints object matching the service
-	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, client.ObjectKey{Name: service.Name, Namespace: service.Namespace}, endpoints); err != nil {
-		logger.Error(err, "Failed to fetch Endpoints for Service", "ServiceName", service.Name)
-		return ctrl.Result{}, err
+
+	// Fetch the EndpointSlices associated with the service
+	var endpointSliceList discoveryv1.EndpointSliceList
+	labelSelector := client.MatchingLabels{
+		discoveryv1.LabelServiceName: service.Name,
 	}
-	if err := r.annotateEndpoints(ctx, *endpoints, optimizer); err != nil {
-		logger.Error(err, "Failed to annotate Endpoints", "ServiceName", service.Name)
+	if err := r.List(ctx, &endpointSliceList, client.InNamespace(service.Namespace), labelSelector); err != nil {
+		logger.Error(err, "Failed to list EndpointSlices for Service", "ServiceName", service.Name)
 		return ctrl.Result{}, err
 	}
 
+	// Annotate the EndpointSlices
+	if err := r.annotateEndpointSlices(ctx, endpointSliceList.Items, optimizer); err != nil {
+		logger.Error(err, "Failed to annotate EndpointSlices", "ServiceName", service.Name)
+		return ctrl.Result{}, err
+	}
+
+	// Collect the ports to process
 	portsToProcess := r.collectPortsToProcess(optimizer, service)
 	logger.V(1).Info("Ports to process", "Ports", portsToProcess)
 	var createdServiceEntries []*istioClientV1.ServiceEntry
 	for _, port := range portsToProcess {
-		// Assume createServiceEntry returns a pointer to a ServiceEntry and error
-		serviceEntry, err := r.createServiceEntry(ctx, service, port, endpoints.Subsets, *optimizer)
+		// Create ServiceEntry using EndpointSlices
+		serviceEntry, err := r.createServiceEntry(ctx, service, port, endpointSliceList.Items, *optimizer)
 		if err != nil {
 			logger.Error(err, "Failed to create ServiceEntry for port", "Port", port.Port)
 			// TODO: Add a metric for failed ServiceEntry creation
@@ -146,23 +136,25 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context
 	return &serviceEntry
 }
 
-// TargetPort is optional and defaults to the port value
-// createServiceEntry constructs a ServiceEntry resource based on the provided Service and ServicePort.
+// createServiceEntry constructs a ServiceEntry resource based on the provided Service, ServicePort, and EndpointSlices.
 // It then creates the ServiceEntry in the Kubernetes API server.
-func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, subsets []corev1.EndpointSubset, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1.ServiceEntry, error) {
+func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, endpointSlices []discoveryv1.EndpointSlice, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1.ServiceEntry, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	host := fmt.Sprintf("%s.%s.svc.cluster.local", service.Name, service.Namespace)
 
 	var serviceEntryEndpoints []*istioNetworkingV1.WorkloadEntry
-	for _, subset := range subsets {
-		for _, address := range subset.Addresses {
-			serviceEndpoint := &istioNetworkingV1.WorkloadEntry{
-				Address: address.IP,
-				Weight:  DefaultWeightForNewEndpoints,
+	for _, endpointSlice := range endpointSlices {
+		for _, endpoint := range endpointSlice.Endpoints {
+			for _, address := range endpoint.Addresses {
+				serviceEndpoint := &istioNetworkingV1.WorkloadEntry{
+					Address: address,
+					Weight:  DefaultWeightForNewEndpoints,
+				}
+				serviceEntryEndpoints = append(serviceEntryEndpoints, serviceEndpoint)
 			}
-			serviceEntryEndpoints = append(serviceEntryEndpoints, serviceEndpoint)
 		}
 	}
+
 	// Create the ServicePort for ServiceEntry
 	servicePort := &istioNetworkingV1.ServicePort{
 		Number:     uint32(port.Port),
@@ -228,8 +220,8 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) handleFinalizer(ctx context.Co
 
 	// If the resource is marked for deletion
 	if helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
-		if err := r.cleanupSpecificEndpointAnnotations(ctx, optimizer, []string{*r.EndpointsAnnotationKey}); err != nil {
-			logger.Error(err, "Error cleaning up specific Endpoint annotations")
+		if err := r.cleanupSpecificEndpointSliceAnnotations(ctx, optimizer, []string{*r.EndpointsAnnotationKey}); err != nil {
+			logger.Error(err, "Error cleaning up specific EndpointSlice annotations")
 			// Return with error to requeue and try cleanup again
 			return ctrl.Result{}, err
 		}
@@ -284,7 +276,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) removeFinalizer(ctx context.Co
 // collectPortsToProcess returns the list of ServicePorts to process based on the optimizer spec and the Service.
 func (r *IstioAdaptiveRequestOptimizerReconciler) collectPortsToProcess(optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, service *corev1.Service) []corev1.ServicePort {
 	var portsToProcess []corev1.ServicePort
-	// TODO log and add a metric when the user add a port that does not exist in the service
+	// TODO log and add a metric when the user adds a port that does not exist in the service
 	if len(optimizer.Spec.ServicePorts) > 0 {
 		optimizerPortsMap := make(map[string]optimizationv1alpha1.ServicePort)
 		for _, optimizerPort := range optimizer.Spec.ServicePorts {
@@ -326,56 +318,65 @@ func normalizeProtocol(protocol string) string {
 	}
 }
 
-func (r *IstioAdaptiveRequestOptimizerReconciler) annotateEndpoints(ctx context.Context, endpoints corev1.Endpoints, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
+// annotateEndpointSlices adds the specified annotation to all EndpointSlices associated with the service.
+func (r *IstioAdaptiveRequestOptimizerReconciler) annotateEndpointSlices(ctx context.Context, endpointSlices []discoveryv1.EndpointSlice, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
 	// Skip if the optimizer is marked for deletion
 	if optimizer.GetDeletionTimestamp() != nil {
 		return nil
 	}
 
 	if len(optimizer.Spec.ServicePorts) > 0 {
-		// Add the optimizer annotation to the Endpoints object
-		if endpoints.Annotations == nil {
-			endpoints.Annotations = make(map[string]string)
-		}
-		endpoints.Annotations[*r.EndpointsAnnotationKey] = "true"
+		for _, endpointSlice := range endpointSlices {
+			// Add the optimizer annotation to the EndpointSlice object
+			if endpointSlice.Annotations == nil {
+				endpointSlice.Annotations = make(map[string]string)
+			}
+			endpointSlice.Annotations[*r.EndpointsAnnotationKey] = "true"
 
-		// Update the Endpoints object with the new annotations
-		if err := r.Update(ctx, &endpoints); err != nil {
-			return err
+			// Update the EndpointSlice object with the new annotations
+			if err := r.Update(ctx, &endpointSlice); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificEndpointAnnotations(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, annotationKeysToRemove []string) error {
+// cleanupSpecificEndpointSliceAnnotations removes specified annotations from all EndpointSlices associated with the service.
+func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificEndpointSliceAnnotations(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, annotationKeysToRemove []string) error {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.Info("Cleaning up specific Endpoint annotations for IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+	logger.Info("Cleaning up specific EndpointSlice annotations for IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
 
-	// Fetch the Endpoints object
-	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, endpoints); err != nil {
-		logger.Error(err, "Failed to fetch Endpoints for Service", "ServiceName", optimizer.Spec.ServiceName)
+	// Fetch the EndpointSlices associated with the service
+	var endpointSliceList discoveryv1.EndpointSliceList
+	labelSelector := client.MatchingLabels{
+		discoveryv1.LabelServiceName: optimizer.Spec.ServiceName,
+	}
+	if err := r.List(ctx, &endpointSliceList, client.InNamespace(optimizer.Spec.ServiceNamespace), labelSelector); err != nil {
+		logger.Error(err, "Failed to list EndpointSlices for Service", "ServiceName", optimizer.Spec.ServiceName)
 		return err
 	}
 
-	modified := false
-	// Iterate over the list of annotation keys that need to be removed
-	for _, key := range annotationKeysToRemove {
-		if _, found := endpoints.Annotations[key]; found {
-			delete(endpoints.Annotations, key)
-			modified = true
+	for _, endpointSlice := range endpointSliceList.Items {
+		modified := false
+		// Iterate over the list of annotation keys that need to be removed
+		for _, key := range annotationKeysToRemove {
+			if _, found := endpointSlice.Annotations[key]; found {
+				delete(endpointSlice.Annotations, key)
+				modified = true
+			}
 		}
-	}
 
-	// Update the Endpoints object to reflect the changes, if any annotation was removed
-	if modified {
-		err := r.Update(ctx, endpoints)
-		if err != nil {
-			logger.Error(err, "Failed to update Endpoints after removing specific annotations", "Endpoints", endpoints.Name, "keysRemoved", annotationKeysToRemove)
-			// If you want to handle errors in a specific way, do it here.
-			return err
+		// Update the EndpointSlice object to reflect the changes, if any annotation was removed
+		if modified {
+			err := r.Update(ctx, &endpointSlice)
+			if err != nil {
+				logger.Error(err, "Failed to update EndpointSlice after removing specific annotations", "EndpointSlice", endpointSlice.Name, "keysRemoved", annotationKeysToRemove)
+				// If you want to handle errors in a specific way, do it here.
+				return err
+			}
+			logger.V(1).Info("Specific annotations removed from EndpointSlice", "EndpointSlice", endpointSlice.Name, "keysRemoved", annotationKeysToRemove)
 		}
-		logger.V(1).Info("Specific annotations removed from Endpoints", "Endpoints", endpoints.Name, "keysRemoved", annotationKeysToRemove)
 	}
 
 	return nil

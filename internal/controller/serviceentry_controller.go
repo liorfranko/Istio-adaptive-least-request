@@ -25,10 +25,9 @@ import (
 	customMetrics "istio-adaptive-least-request/internal/metrics"
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -81,7 +80,6 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Step 3: Validate that the endpoints in the ServiceEntry match the current cluster state
-	//serviceEntryUpdated, validationErr := r.ValidateAndUpdateWeights(ctx, req, opt)
 	_, validationErr := r.ValidateAndUpdateWeights(ctx, req, opt)
 	if validationErr != nil {
 		logger.Error(validationErr, "Failed to validate or update weights.")
@@ -91,7 +89,7 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
-// HandleEndpointUpdate checks for changes in the Endpoints and updates the ServiceEntry if necessary.
+// HandleEndpointUpdate checks for changes in the EndpointSlices and updates the ServiceEntry if necessary.
 func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 
@@ -110,15 +108,21 @@ func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req c
 		return ctrl.Result{}, nil // or an error, as appropriate
 	}
 
-	// Construct the NamespacedName for the Endpoints object, assuming it's in the same namespace.
-	endpointsNamespacedName := types.NamespacedName{Namespace: req.Namespace, Name: originalServiceName}
-
-	// Fetch the corresponding Endpoints object.
-	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, endpointsNamespacedName, endpoints); err != nil {
-		logger.Error(err, "Failed to fetch Endpoints for service", "Namespace", endpointsNamespacedName.Namespace, "Name", endpointsNamespacedName.Name)
+	// List all EndpointSlices for the given service in the same namespace using label selectors.
+	var endpointSlices discoveryv1.EndpointSliceList
+	labelSelector := client.MatchingLabels{
+		"kubernetes.io/service-name": originalServiceName,
+	}
+	if err := r.List(ctx, &endpointSlices, client.InNamespace(req.Namespace), labelSelector); err != nil {
+		logger.Error(err, "Failed to list EndpointSlices for service", "Namespace", req.Namespace, "Name", originalServiceName)
 		return ctrl.Result{}, err
 	}
+
+	if len(endpointSlices.Items) == 0 {
+		logger.Info("No EndpointSlices found for service", "Namespace", req.Namespace, "Name", originalServiceName)
+		return ctrl.Result{}, nil // No endpoints to process
+	}
+
 	// Track existing endpoint weights.
 	existingWeights := map[string]uint32{}
 	for _, ep := range serviceEntry.Spec.Endpoints {
@@ -128,17 +132,27 @@ func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req c
 	// Calculate average weight for new endpoints.
 	averageWeight := r.CreateDefaultWeightForNewEndpoints(existingWeights)
 	logger.Info("Calculated average weight for new endpoints", "AverageWeight", averageWeight)
-	// Aggregate endpoints, assigning average weight to new ones.
-	var mergedEndpoints []*istioNetworkingV1.WorkloadEntry
-	for _, subset := range endpoints.Subsets {
-		for _, address := range subset.Addresses {
-			weight, found := existingWeights[address.IP]
+
+	// Aggregate endpoints from all EndpointSlices, assigning average weight to new ones.
+	mergedEndpoints := []*istioNetworkingV1.WorkloadEntry{}
+	for _, slice := range endpointSlices.Items {
+		for _, endpoint := range slice.Endpoints {
+			// Prefer the IPv4 address; fallback to IPv6 if necessary
+			var ip string
+			if len(endpoint.Addresses) > 0 {
+				ip = endpoint.Addresses[0]
+			}
+			if ip == "" {
+				continue // Skip endpoints without an IP address
+			}
+
+			weight, found := existingWeights[ip]
 			if !found {
 				weight = averageWeight // Assign the calculated average weight if new.
 			}
 
 			mergedEndpoints = append(mergedEndpoints, &istioNetworkingV1.WorkloadEntry{
-				Address: address.IP,
+				Address: ip,
 				Weight:  weight,
 			})
 		}
@@ -150,11 +164,12 @@ func (r *ServiceEntryReconciler) HandleEndpointUpdate(ctx context.Context, req c
 		return ctrl.Result{}, nil // No changes, no need to update.
 	}
 	logger.Info("Detected endpoint changes", "ServiceEntry", serviceEntry.Name)
+
 	// Update the ServiceEntry with the newly merged endpoints.
 	serviceEntry.Spec.Endpoints = mergedEndpoints
 	if err := r.Update(ctx, &serviceEntry); err != nil {
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
-		return ctrl.Result{}, nil // or an error, as appropriate
+		return ctrl.Result{}, err // Return the error to retry
 	}
 
 	logger.Info("ServiceEntry updated successfully with dynamic weighting", "ServiceEntry", serviceEntry.Name)
@@ -255,22 +270,16 @@ func addressesChanged(existingEndpoints, newEndpoints []*istioNetworkingV1.Workl
 func (r *ServiceEntryReconciler) SetupWithManager(mgr ctrl.Manager, logger logr.Logger) error {
 	namespacePredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			//logger.Info("Create event received", "object", e.Object)
 			namespace := e.Object.GetNamespace()
-			//logger.Info("Create event for namespace", "namespace", namespace)
 			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
-			//logger.Info("Namespace in list", "inList", inList)
 			return inList
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			return false
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			//logger.Info("Update event received", "old object", e.ObjectOld, "new object", e.ObjectNew)
 			namespace := e.ObjectNew.GetNamespace()
-			//logger.Info("Update event for namespace", "namespace", namespace)
 			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
-			//logger.Info("Namespace in list", "inList", inList)
 			return inList
 		},
 	}

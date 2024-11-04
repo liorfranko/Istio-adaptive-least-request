@@ -38,7 +38,6 @@ import (
 	"strings"
 	"time"
 
-	//istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -169,13 +168,11 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// create a map of pod ips and their names from pods ips
 		// Fetch pods using the selector
-		// C
 		podsInfo, err := r.listPods(ctx, istioOptimizer.Namespace, labels.SelectorFromSet(serviceEntry.Spec.Endpoints[0].Labels))
 		if err != nil {
 			logger.Error(err, "Failed to list Pods", "Namespace", istioOptimizer.Namespace)
 			return ctrl.Result{}, err
 		}
-		//logger.V(1).Info("Pods fetched", "Pods", podsInfo)
 		// Get the metrics from VictoriaMetrics for the service and protocol
 		podsMetrics, err := r.getPodMetrics(ctx, istioOptimizer.Name, istioOptimizer.Namespace, podsInfo)
 		if err != nil {
@@ -270,10 +267,19 @@ func (r *WeightOptimizerReconciler) getCPUMetrics(ctx context.Context, service s
 	queryPattern := fmt.Sprintf(`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s])) by (pod)`, namespace, service, r.QueryInterval)
 	logger.V(1).Info("queryPattern", "queryPattern", queryPattern)
 	query := url.QueryEscape(queryPattern)
+	// Start timer
+	startTime := time.Now()
 	CpuTime, err := r.getVMCPUQueryMetric(ctx, query)
 	if err != nil {
 		return map[string]*PodCPUMetrics{}, err
 	}
+	// Measure elapsed time
+	elapsedTime := time.Since(startTime).Seconds() // in seconds
+	queryLabels := prometheus.Labels{
+		"service_name":      service,
+		"service_namespace": namespace,
+	}
+	customMetrics.QueryLatencyMetric.With(queryLabels).Set(elapsedTime)
 	// Then process the response to return a slice of `PodMetrics`. Assume `response` is what you got from VictoriaMetrics.
 	podCPUMetrics := make(map[string]*PodCPUMetrics)
 	for _, v := range CpuTime.Data.Result {
@@ -673,7 +679,6 @@ func (r *WeightOptimizerReconciler) calculateNewWeight(currentWeight uint32, mul
 }
 
 func (r *WeightOptimizerReconciler) updateMetrics(weightOptimizer *optimizationv1alpha1.WeightOptimizer, totalWeight float64) {
-	// logger.Info("Updating Prometheus metrics", "ServiceEntry", serviceEntry.Name, "IP", ep.IP, "ServiceName", ep.WeightOptimizer.ServiceName, "ServiceNamespace", ep.WeightOptimizer.ServiceNamespace)
 	for _, ep := range weightOptimizer.Spec.Endpoints {
 		customMetrics.AlphaMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.Alpha)
 		customMetrics.DistanceMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.Distance)
@@ -801,7 +806,7 @@ func (r *WeightOptimizerReconciler) newCakeTrick(ctx context.Context, podsMetric
 				logger.Info("New weight and CPU time", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "NewWeight", adjustedWeight, "EstimatedCpuTime", EstimatedCpuTime)
 			} else {
 				EstimatedCpuTimes[ep.PodAddress] = ep.CPUTime
-				logger.Info("Adjusted weight is zero, keeping original CPU time", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime)
+				logger.Info("Adjusted weight is zero, keeping weight", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "CPUTime", ep.CPUTime, "Weight", currentWeight)
 			}
 		}
 	}
