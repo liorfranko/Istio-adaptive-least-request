@@ -51,6 +51,8 @@ spec:
                     lastOptimized:
                       format: date-time
                       type: string
+                    locality:
+                      type: string
                     multiplier:
                       type: number
                     name:
@@ -71,6 +73,7 @@ spec:
                   - distance
                   - ip
                   - lastOptimized
+                  - locality
                   - multiplier
                   - name
                   - optimized
@@ -80,6 +83,8 @@ spec:
                   - weight
                   type: object
                 type: array
+              locality:
+                type: boolean
             type: object
           status:
             description: WeightOptimizerStatus defines the observed state of WeightOptimizer

@@ -35,4 +35,9 @@ resources:
   group: optimization
   kind: ServiceEntry
   version: v1alpha1
+- controller: true
+  domain: liorfranko.github.io
+  group: optimization
+  kind: EndpointSlice
+  version: v1alpha1
 version: "3"

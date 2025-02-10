@@ -28,12 +28,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"math"
 	"net/http"
 	"net/url"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -63,22 +61,7 @@ type WeightOptimizerReconciler struct {
 	StepInterval                  string
 	MinOptimizeCpuDistancePercent float64
 	CpuDistanceMultiplierPercent  float64
-}
-
-type VmdbRespone struct {
-	Status string `json:"status"`
-	Data   struct {
-		ResultType string `json:"resultType"`
-		Result     []struct {
-			Metric struct {
-				PodName      string `json:"pod_name"`
-				PodIp        string `json:"pod_address"`
-				ResponseCode string `json:"response_code"`
-				GrpcStatus   string `json:"grpc_response_status"`
-			} `json:"metric"`
-			Value []json.RawMessage `json:"value"`
-		} `json:"result"`
-	} `json:"data"`
+	ScalingFactor                 float64
 }
 
 type VmdbCPURespone struct {
@@ -95,15 +78,10 @@ type VmdbCPURespone struct {
 }
 
 type PodMetrics struct {
-	PodName           string  `json:"podName"`
-	PodAddress        string  `json:"podAddress"`
-	Average           float64 `json:"average"`
-	StandardDeviation float64 `json:"standard_deviation"`
-	Multiplier        float64 `json:"multiplier"`
-	Distance          float64 `json:"distance"`
-	Alpha             float64 `json:"alpha"`
-	CPUTime           float64 `json:"cpuTime"`
-	Weight            uint32  `json:"weight"`
+	PodName    string  `json:"podName"`
+	PodAddress string  `json:"podAddress"`
+	CPUTime    float64 `json:"cpuTime"`
+	Weight     uint32  `json:"weight"`
 }
 
 type PodCPUMetrics struct {
@@ -125,8 +103,8 @@ type PodInfo struct {
 func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile WeightOptimizer", "WeightOptimizer.Namespace", req.Namespace, "WeightOptimizer.Name", req.Name)
-	istioOptimizer := &optimizationv1alpha1.IstioAdaptiveRequestOptimizer{}
-	if err := r.Get(ctx, req.NamespacedName, istioOptimizer); err != nil {
+	var istioOptimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer
+	if err := r.Get(ctx, req.NamespacedName, &istioOptimizer); err != nil {
 		logger.Info("IstioLatencyOptimizer not found", "Namespace", req.Namespace, "Name", req.Name)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -141,11 +119,9 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Name:      fmt.Sprintf("%s-%d", istioOptimizer.Name, servicePort.Number),
 			Namespace: istioOptimizer.Namespace,
 		}
-
 		// Fetch the ServiceEntry for the port
-		serviceEntry := istionetworkingv1.ServiceEntry{}
-		err := r.Get(ctx, objectKey, &serviceEntry)
-		if err != nil {
+		var serviceEntry istionetworkingv1.ServiceEntry
+		if err := r.Get(ctx, objectKey, &serviceEntry); err != nil {
 			// If the ServiceEntry not found, log an error and continue to the next port
 			logger.Error(err, "ServiceEntry not exists, continue to the next port if there is", "ServiceEntry", serviceEntry.Name)
 			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetch_service_entry", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
@@ -154,13 +130,8 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		logger.V(1).Info("Fetched ServiceEntry", "ServiceEntry", serviceEntry.Name)
 
 		// Create a map of the weights of the endpoints from the ServiceEntry
-		serviceEntryWeightsMap, err := r.getServiceEntryWeightMap(&serviceEntry)
-		if err != nil {
-			// If there is a problem with creating the serviceEntryWeightsMap, log an error and continue to the next port
-			logger.Error(err, "Error creating serviceEntryWeightsMap for ServiceEntry, continue to the next port if there is", "ServiceEntry", serviceEntry.Name)
-			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "create_service_entry_weight_map", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-			continue
-		}
+		serviceEntryWeightsMap := r.getServiceEntryWeightMap(&serviceEntry)
+		serviceEntryLocalityMap := r.getServiceEntryLocalityMap(&serviceEntry)
 
 		if len(serviceEntry.Spec.Endpoints) == 0 {
 			logger.Info("ServiceEntry doesn't have any endpoints, continue", "ServiceEntry", serviceEntry.Name)
@@ -175,13 +146,13 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Error(err, "Failed to list Pods", "Namespace", istioOptimizer.Namespace)
 			return ctrl.Result{}, err
 		}
-		logger.V(1).Info("Pods fetched", "Pods", podsInfo)
+		//logger.V(1).Info("Pods fetched", "Pods", podsInfo)
 		// Get the metrics from VictoriaMetrics for the service and protocol
 		podsMetrics, err := r.getPodMetrics(ctx, istioOptimizer.Name, istioOptimizer.Namespace, podsInfo)
 		if err != nil {
 			// If there is a problem with pulling the metrics from VictoriaMetrics, log an error and continue to the next port
 			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "get_metrics_from_vm", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-			err := r.fallbackStrategy(ctx, istioOptimizer, objectKey, servicePort, serviceEntryWeightsMap, podsInfo)
+			err := r.fallbackStrategy(ctx, &istioOptimizer, objectKey, servicePort, serviceEntryWeightsMap, serviceEntryLocalityMap, podsInfo)
 			if err != nil {
 				customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fallback_strategy", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
 				return ctrl.Result{}, err
@@ -191,23 +162,24 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		// Update pod metrics based on the response from VictoriaMetrics
-		err = r.updatePodMetrics(ctx, &podsMetrics)
-		if err != nil {
-			// If there is a problem with calculating the Alpha,Distance,Multipliar from VictoriaMetrics, log an error and continue to the next port
-			logger.Error(err, "Error calculating the Alpha,Distance,Multipliar based on the response from VictoriaMetrics, continue to the next port if there is", "service.Name", istioOptimizer.Name, "port", servicePort.Number)
+		if err = r.updatePodMetrics(ctx, &podsMetrics); err != nil {
+			// If there is a problem with calculating the Alpha,Distance,Multiplier from VictoriaMetrics, log an error and continue to the next port
+			logger.Error(err, "Error calculating the Alpha,Distance,Multiplier based on the response from VictoriaMetrics, continue to the next port if there is", "service.Name", istioOptimizer.Name, "port", servicePort.Number)
 			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "update_pod_metrics", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
 			continue
 		}
 
 		// Fetch the WeightOptimizer for the port
-		weightOptimizer, err := r.ensureWeightOptimizer(ctx, istioOptimizer, objectKey, serviceEntryWeightsMap)
+		weightOptimizer, err := r.ensureWeightOptimizer(ctx, &istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap)
 		if err != nil {
 			logger.Error(err, "Failed to ensure WeightOptimizer is available")
 			return ctrl.Result{}, err
 		}
 
+		newWeightsMap, err := r.distributeWeightsBasedOnCPU(ctx, podsMetrics, serviceEntryWeightsMap, serviceEntryLocalityMap)
+		updatedWeightOptimizer, totalWeight, err := r.calculateNewWeights(ctx, podsMetrics, newWeightsMap, istioOptimizer.Namespace, weightOptimizer, serviceEntryLocalityMap)
 		// Calculate the new weights based on the metrics
-		updatedWeightOptimizer, totalWeight, err := r.calculateNewWeights(ctx, podsMetrics, serviceEntryWeightsMap, objectKey, istioOptimizer.Namespace, weightOptimizer)
+		//updatedWeightOptimizer, totalWeight, err := r.calculateNewWeights(ctx, podsMetrics, serviceEntryWeightsMap, objectKey, istioOptimizer.Namespace, weightOptimizer)
 		if err != nil {
 			logger.Error(err, "Error calculating new weights, continue to the next port if there is", "service.Name", istioOptimizer.Name, "port", servicePort.Number)
 			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "calculate_new_weights", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
@@ -226,6 +198,14 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Requeue to process services periodically
 	return ctrl.Result{RequeueAfter: r.RequeueAfter * time.Second}, nil
+}
+
+func (r *WeightOptimizerReconciler) getServiceEntryLocalityMap(serviceEntry *istionetworkingv1.ServiceEntry) map[string]string {
+	localityMap := make(map[string]string)
+	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
+		localityMap[workloadEntry.Address] = workloadEntry.Locality
+	}
+	return localityMap
 }
 
 // getVMQueryMetric queries VictoriaMetrics for the given service and protocol and returns the response.
@@ -268,10 +248,19 @@ func (r *WeightOptimizerReconciler) getCPUMetrics(ctx context.Context, service s
 	queryPattern := fmt.Sprintf(`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s])) by (pod)`, namespace, service, r.QueryInterval)
 	logger.V(1).Info("queryPattern", "queryPattern", queryPattern)
 	query := url.QueryEscape(queryPattern)
+	// Start timer
+	startTime := time.Now()
 	CpuTime, err := r.getVMCPUQueryMetric(ctx, query)
 	if err != nil {
 		return map[string]*PodCPUMetrics{}, err
 	}
+	// Measure elapsed time
+	elapsedTime := time.Since(startTime).Seconds() // in seconds
+	queryLabels := prometheus.Labels{
+		"service_name":      service,
+		"service_namespace": namespace,
+	}
+	customMetrics.QueryLatencyMetric.With(queryLabels).Set(elapsedTime)
 	// Then process the response to return a slice of `PodMetrics`. Assume `response` is what you got from VictoriaMetrics.
 	podCPUMetrics := make(map[string]*PodCPUMetrics)
 	for _, v := range CpuTime.Data.Result {
@@ -321,28 +310,58 @@ func (r *WeightOptimizerReconciler) getVMCPUQueryMetric(ctx context.Context, que
 }
 
 func (r *WeightOptimizerReconciler) listPods(ctx context.Context, namespace string, selector labels.Selector) ([]PodInfo, error) {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	podList := &corev1.PodList{}
 	listOpts := &client.ListOptions{Namespace: namespace, LabelSelector: selector}
 	if err := r.Client.List(ctx, podList, listOpts); err != nil {
 		return nil, err
 	}
+
 	var podsInfo []PodInfo
 	for _, pod := range podList.Items {
+		// Skip pods that are being deleted
+		if pod.DeletionTimestamp != nil {
+			logger.V(1).Info("Skipping pod: marked for deletion", "podName", pod.Name)
+			continue
+		}
+
+		// Check if pod is ready
+		isReady := false
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				isReady = true
+				break
+			}
+		}
+
+		if !isReady {
+			logger.V(1).Info("Skipping pod: not ready", "podName", pod.Name)
+			continue
+		}
+
+		if pod.Status.PodIP == "" {
+			logger.V(1).Info("Skipping pod: no IP address", "podName", pod.Name)
+			continue
+		}
+
 		podsInfo = append(podsInfo, PodInfo{
 			PodAddress: pod.Status.PodIP,
 			PodName:    pod.Name,
 			CPUTime:    0.0,
 		})
+		logger.V(1).Info("Added pod to list", "podName", pod.Name, "podIP", pod.Status.PodIP)
 	}
+
+	logger.Info("Finished listing pods", "totalPods", len(podList.Items), "readyPods", len(podsInfo))
 	return podsInfo, nil
 }
 
 // fallbackStrategy checks if a fallback condition is met and resets weights if necessary.
-func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, objectKey client.ObjectKey, servicePort optimizationv1alpha1.ServicePort, serviceEntryWeightsMap map[string]uint32, podsInfo []PodInfo) error {
+func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, objectKey client.ObjectKey, servicePort optimizationv1alpha1.ServicePort, serviceEntryWeightsMap map[string]uint32, serviceEntryLocalityMap map[string]string, podsInfo []PodInfo) error {
 	logger := log.FromContext(ctx).WithName(r.LoggerName).WithValues("service.name", istioOptimizer.Name, "service.namespace", istioOptimizer.Namespace, "port", servicePort.Number)
 	logger.Info("Initiating fallback strategy check")
 
-	weightOptimizer, err := r.ensureWeightOptimizer(ctx, istioOptimizer, objectKey, serviceEntryWeightsMap)
+	weightOptimizer, err := r.ensureWeightOptimizer(ctx, istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap)
 	if err != nil {
 		logger.Error(err, "Failed to ensure WeightOptimizer is available")
 		return err
@@ -355,7 +374,7 @@ func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioO
 
 	logger.Info("Weights reset to default due to timeout")
 	weightOptimizer.Spec.Endpoints = []optimizationv1alpha1.Endpoint{}
-	if err := r.resetWeights(ctx, weightOptimizer, podsInfo); err != nil {
+	if err := r.resetWeights(ctx, weightOptimizer, podsInfo, serviceEntryLocalityMap); err != nil {
 		return err
 	}
 
@@ -374,7 +393,7 @@ func shouldSkipFallback(weightOptimizer *optimizationv1alpha1.WeightOptimizer) b
 }
 
 // Reset weights to default values and update the WeightOptimizer.
-func (r *WeightOptimizerReconciler) resetWeights(ctx context.Context, weightOptimizer *optimizationv1alpha1.WeightOptimizer, podsInfo []PodInfo) error {
+func (r *WeightOptimizerReconciler) resetWeights(ctx context.Context, weightOptimizer *optimizationv1alpha1.WeightOptimizer, podsInfo []PodInfo, serviceEntryLocalityMap map[string]string) error {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	for _, podInfo := range podsInfo {
 		logger.Info("Resetting endpoint to default values", "endpoint", podInfo.PodAddress)
@@ -390,6 +409,7 @@ func (r *WeightOptimizerReconciler) resetWeights(ctx context.Context, weightOpti
 			LastOptimized:    metav1.Time{Time: time.Now()},
 			ServiceName:      weightOptimizer.Name,
 			ServiceNamespace: weightOptimizer.Namespace,
+			Locality:         serviceEntryLocalityMap[podInfo.PodAddress],
 		})
 	}
 	if err := r.Update(ctx, weightOptimizer); err != nil {
@@ -399,28 +419,31 @@ func (r *WeightOptimizerReconciler) resetWeights(ctx context.Context, weightOpti
 	return nil
 }
 
-func (r *WeightOptimizerReconciler) ensureWeightOptimizer(ctx context.Context, istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, objectKey client.ObjectKey, serviceEntryWeightsMap map[string]uint32) (*optimizationv1alpha1.WeightOptimizer, error) {
+func (r *WeightOptimizerReconciler) ensureWeightOptimizer(ctx context.Context, istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, objectKey client.ObjectKey, serviceEntryWeightsMap map[string]uint32, serviceEntryLocalityMap map[string]string) (*optimizationv1alpha1.WeightOptimizer, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	// Fetch the WeightOptimizer for the port
-	weightOptimizer := &optimizationv1alpha1.WeightOptimizer{}
+	weightOptimizer := new(optimizationv1alpha1.WeightOptimizer)
 	err := r.Get(ctx, objectKey, weightOptimizer)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// If weightOptimizer not found, create a new instance
-			logger.Info("weightOptimizer not found, creating a new one", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name)
-			weightOptimizer, err = r.createWeightOptimizer(ctx, nil, objectKey, istioOptimizer.Namespace, *istioOptimizer, serviceEntryWeightsMap)
-			if err != nil {
-				logger.Error(err, "Failed to create WeightOptimizer", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name)
-				customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "create_weight_optimizer", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-				return nil, err
-			}
-		} else {
-			logger.Error(err, "Failed to fetch WeightOptimizer", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name)
-			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetch_weight_optimizer", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-			return nil, err
+	if err == nil {
+		logger.V(1).Info("Fetched or created WeightOptimizer", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name, "Spec", weightOptimizer.Spec)
+		if weightOptimizer.Spec.LocalityEnabled != istioOptimizer.Spec.LocalityEnabled {
+			weightOptimizer.Spec.LocalityEnabled = istioOptimizer.Spec.LocalityEnabled
 		}
+		return weightOptimizer, nil
 	}
-	logger.V(1).Info("Fetched or created WeightOptimizer", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name, "Spec", weightOptimizer.Spec)
+	if !errors.IsNotFound(err) {
+		logger.Error(err, "Failed to fetch WeightOptimizer", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name)
+		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetch_weight_optimizer", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
+		return nil, err
+	}
+	// If weightOptimizer not found, create a new instance
+	logger.Info("weightOptimizer not found, creating a new one", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name)
+	weightOptimizer, err = r.createWeightOptimizer(ctx, nil, objectKey, istioOptimizer.Namespace, *istioOptimizer, serviceEntryWeightsMap, serviceEntryLocalityMap)
+	if err != nil {
+		logger.Error(err, "Failed to create WeightOptimizer", "Namespace", istioOptimizer.Namespace, "Name", objectKey.Name)
+		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "create_weight_optimizer", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
+		return nil, err
+	}
 	return weightOptimizer, nil
 }
 
@@ -440,100 +463,71 @@ func (r *WeightOptimizerReconciler) updatePodMetrics(ctx context.Context, podsMe
 	averageCPU, _ := stats.Mean(cpuTimes)
 
 	standardDeviationCPU, _ := stats.StdDevP(cpuTimes)
-	logger.V(1).Info("averageCPU", "averageCPU", averageCPU)
-	logger.V(1).Info("standardDeviationCPU", "standardDeviationCPU", standardDeviationCPU)
+	logger.V(4).Info("averageCPU", "averageCPU", averageCPU)
+	logger.V(4).Info("standardDeviationCPU", "standardDeviationCPU", standardDeviationCPU)
 	for _, ep := range *podsMetrics {
 		if ep.CPUTime == 0.0 {
 			// Pods without CPU metrics will have the averageCPU, and are not optimized
 			ep.CPUTime = averageCPU
 		}
 		cpuDistance := ep.CPUTime - averageCPU
-		if math.Abs(cpuDistance)/averageCPU < (r.MinOptimizeCpuDistancePercent / 100) {
-			logger.V(1).Info("Cpu distance is less than the minimum alpha will be 0", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "cpuDistance", cpuDistance, "cpuAlpha", ep.Alpha, "cpuMultiplier", ep.Multiplier)
-			// Don't make changes if the distance is less than the minimum
-			ep.Alpha = 0
-		} else {
-			ep.Alpha = cpuDistance * ((r.CpuDistanceMultiplierPercent / 100) / averageCPU)
-		}
-		ep.Multiplier = 1 - ep.Alpha
-		logger.V(1).Info("Updated pod metrics", "PodName", ep.PodName, "PodAddress", ep.PodAddress, "cpuDistance", cpuDistance, "cpuAlpha", ep.Alpha, "cpuMultiplier", ep.Multiplier)
-
-		// Directly modify each element in the slice
-		ep.Average = averageCPU
-		ep.Distance = cpuDistance
-		ep.StandardDeviation = standardDeviationCPU
-		if math.IsNaN(ep.Multiplier) {
-			ep.Multiplier = 1
-		}
+		logger.V(4).Info("CPU Distance", "CPU Distance", cpuDistance)
 	}
 	return nil
 }
 
-func (r *WeightOptimizerReconciler) getServiceEntryWeightMap(serviceEntry *istionetworkingv1.ServiceEntry) (map[string]uint32, error) {
-	// Change it to return a map of WorkloadEntry
-
+func (r *WeightOptimizerReconciler) getServiceEntryWeightMap(serviceEntry *istionetworkingv1.ServiceEntry) map[string]uint32 {
+	// TODO: Change it to return a map of WorkloadEntry
 	weightsMap := make(map[string]uint32)
 	for _, ep := range serviceEntry.Spec.Endpoints {
 		weightsMap[ep.Address] = ep.Weight
 	}
-	return weightsMap, nil
+	return weightsMap
 }
 
-func (r *WeightOptimizerReconciler) getWeightOptimizerMap(weightOptimizer *optimizationv1alpha1.WeightOptimizer) (map[string]optimizationv1alpha1.Endpoint, error) {
+func (r *WeightOptimizerReconciler) getWeightOptimizerMap(weightOptimizer *optimizationv1alpha1.WeightOptimizer) map[string]optimizationv1alpha1.Endpoint {
 	weightsMap := make(map[string]optimizationv1alpha1.Endpoint)
 	for _, ep := range weightOptimizer.Spec.Endpoints {
 		weightsMap[ep.IP] = ep
 	}
-	return weightsMap, nil
+	return weightsMap
 }
 
-func (r *WeightOptimizerReconciler) calculateNewWeights(ctx context.Context, podsMetrics map[string]*PodMetrics, serviceEntryWeightsMap map[string]uint32, objectKey client.ObjectKey, namespace string, weightOptimizer *optimizationv1alpha1.WeightOptimizer) (*optimizationv1alpha1.WeightOptimizer, float64, error) {
+func (r *WeightOptimizerReconciler) calculateNewWeights(ctx context.Context, podsMetrics map[string]*PodMetrics, newWeights map[string]uint32, namespace string, weightOptimizer *optimizationv1alpha1.WeightOptimizer, serviceEntryLocalityMap map[string]string) (*optimizationv1alpha1.WeightOptimizer, float64, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 
 	// create a map of the weights of the endpoints from the WeightOptimizer
-	weightOptimizerMap, err := r.getWeightOptimizerMap(weightOptimizer)
-
-	if err != nil {
-		logger.Error(err, "Error creating a weightOptimizerMap", "WeightOptimizer", weightOptimizer.Name)
-		return weightOptimizer, 0.0, err
-	}
+	weightOptimizerMap := r.getWeightOptimizerMap(weightOptimizer)
 
 	weightsMap := make(map[string]uint32)
-	filteredEndpoints := []optimizationv1alpha1.Endpoint{}
-	// Iterate over the podsMetrics and keep the ones that exists in the WeightOptimizer and in the ServiceEntry
-	// When a pod is no longer shown in VictoriaMetrics response, it won't be added to the filteredEndpoints and will be removed from the WeightOptimizer
-	// When a pod is no longer exists in the ServiceEntry, it won't be added to the filteredEndpoints and it will be removed from the WeightOptimizer
-	// When a pod exists in the VictoriaMetrics and the ServiceEntry but not in the WeightOptimizer, it will be added to the WeightOptimizer
+	var filteredEndpoints []optimizationv1alpha1.Endpoint
 	for _, result := range podsMetrics {
-		// Check if the endpoint exists in the ServiceEntry
-		currentWeight, ok := serviceEntryWeightsMap[result.PodAddress]
+		newWeight, ok := newWeights[result.PodAddress]
 		if !ok {
 			logger.Info("Endpoint exists in VictoriaMetrics response but not found in serviceEntryWeightsMap - don't optimize it and continue", "IP", result.PodAddress)
 			continue
 		}
+		logger.V(1).Info("newWeight status", "IP", result.PodAddress, "CurrentWeight", newWeight)
 		// Check if the endpoint exists in the WeightOptimizer
 		weightOptimizerEndpoint, ok := weightOptimizerMap[result.PodAddress]
 		if !ok {
 			logger.Info("Endpoint exists in VictoriaMetrics response but not found in WeightOptimizer - adding it", "IP", result.PodAddress)
+			if newWeights[result.PodAddress] == 0 {
+				logger.Info("Weight is 0, skipping", "PodAddress", result.PodAddress, "PodName", result.PodName)
+				continue
+			}
 			weightOptimizerEndpoint = optimizationv1alpha1.Endpoint{
 				ServiceName:      weightOptimizer.Name,
 				ServiceNamespace: namespace,
 				IP:               result.PodAddress,
 				Name:             result.PodName,
-				Multiplier:       result.Multiplier,
-				Distance:         result.Distance,
-				Alpha:            result.Alpha,
-				Weight:           currentWeight,
+				Weight:           newWeights[result.PodAddress],
 				Optimized:        false,
 				LastOptimized:    metav1.Time{Time: time.Now()},
 			}
 		}
-		// The pod exists in VictoriaMetrics response and in the ServiceEntry and in the WeightOptimizer
-		// Calculate the new weight based on the existing weight and the multiplier
-		updatedWeight := r.calculateNewWeight(currentWeight, weightOptimizerEndpoint.Multiplier)
-		logger.V(1).Info("Updated weight", "IP", weightOptimizerEndpoint.IP, "CurrentWeight", currentWeight, "NewWeight", updatedWeight)
-		// Add the updated weight to the weightsMap and the filteredEndpoints
-		weightsMap[result.PodAddress] = updatedWeight
+		weightOptimizerEndpoint.Locality = serviceEntryLocalityMap[result.PodAddress]
+		weightsMap[result.PodAddress] = newWeight
 		filteredEndpoints = append(filteredEndpoints, weightOptimizerEndpoint)
 	}
 
@@ -549,35 +543,24 @@ func (r *WeightOptimizerReconciler) calculateNewWeights(ctx context.Context, pod
 		if !found {
 			logger.V(1).Info("Endpoint exists in WeightOptimizer but not found in filteredEndpoint - deleting the metric", "IP", weightOptimizerEndpoint.IP)
 			// Remove the metrics of the endpoint that is no longer exists in the WeightOptimizer
-			removedMetrics := helpers.CleanupPodMetrics(weightOptimizerEndpoint.ServiceName, weightOptimizerEndpoint.ServiceNamespace, weightOptimizerEndpoint.Name, weightOptimizerEndpoint.IP)
+			removedMetrics := helpers.CleanupPodMetrics(weightOptimizerEndpoint.ServiceName, weightOptimizerEndpoint.ServiceNamespace, weightOptimizerEndpoint.Name, weightOptimizerEndpoint.IP, weightOptimizerEndpoint.Locality)
 			logger.V(1).Info("Number of metrics that removed is", "IP", weightOptimizerEndpoint.IP, "RemovedMetrics", removedMetrics)
 		}
 	}
-
-	// Update the WeightOptimizer with the filteredEndpoints
 	weightOptimizer.Spec.Endpoints = filteredEndpoints
-
-	// Calculate the median weight
-	medianWeight := getMedianWeight(weightsMap)
-	logger.V(1).Info("Median weight", "MedianWeight", medianWeight)
-
-	// Adjust weights to ensure the median weight is at the middle of the weight range
-	adjustedWeightsMap := r.adjustWeightsToMedian(weightsMap, medianWeight)
-	logger.V(1).Info("Adjusted weights", "AdjustedWeights", adjustedWeightsMap)
 
 	totalWeight := 0.0
 	for i, weightOptimizerEndpoint := range weightOptimizer.Spec.Endpoints {
-		weightOptimizer.Spec.Endpoints[i].Weight = adjustedWeightsMap[weightOptimizerEndpoint.IP]
-		weightOptimizer.Spec.Endpoints[i].Multiplier = podsMetrics[weightOptimizerEndpoint.IP].Multiplier
-		weightOptimizer.Spec.Endpoints[i].Alpha = podsMetrics[weightOptimizerEndpoint.IP].Alpha
-		weightOptimizer.Spec.Endpoints[i].Distance = podsMetrics[weightOptimizerEndpoint.IP].Distance
-		totalWeight += float64(weightOptimizerEndpoint.Weight)
+		weightOptimizer.Spec.Endpoints[i].Weight = newWeights[weightOptimizerEndpoint.IP]
+		totalWeight += float64(newWeights[weightOptimizerEndpoint.IP])
+		logger.V(1).Info("Updated weight", "IP", weightOptimizerEndpoint.IP, "NewWeight", newWeights[weightOptimizerEndpoint.IP])
 	}
+
 	return weightOptimizer, totalWeight, nil
 }
 
 // constructWeightOptimizer creates a new WeightOptimizer instance based on the processed metrics.
-func (r *WeightOptimizerReconciler) createWeightOptimizer(ctx context.Context, podsMetrics map[string]*PodMetrics, objectKey client.ObjectKey, namespace string, istioOptimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntryWeightsMap map[string]uint32) (*optimizationv1alpha1.WeightOptimizer, error) {
+func (r *WeightOptimizerReconciler) createWeightOptimizer(ctx context.Context, podsMetrics map[string]*PodMetrics, objectKey client.ObjectKey, namespace string, istioOptimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntryWeightsMap map[string]uint32, serviceEntryLocalityMap map[string]string) (*optimizationv1alpha1.WeightOptimizer, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	// Create the weightOptimizer instance with the owner reference set to the IstioLatencyOptimizer
 	weightOptimizer := &optimizationv1alpha1.WeightOptimizer{
@@ -595,6 +578,10 @@ func (r *WeightOptimizerReconciler) createWeightOptimizer(ctx context.Context, p
 		},
 	}
 	logger.V(1).Info("Constructing WeightOptimizer", "Namespace", namespace, "Name", weightOptimizer.Name)
+
+	spec := &weightOptimizer.Spec
+	spec.LocalityEnabled = istioOptimizer.Spec.LocalityEnabled
+
 	// Iterate over the podsMetrics and add the pods that exists in the ServiceEntry
 	// If the endpoint is not found in the ServiceEntry, log a warning and continue without that pod
 	for _, result := range podsMetrics {
@@ -603,17 +590,14 @@ func (r *WeightOptimizerReconciler) createWeightOptimizer(ctx context.Context, p
 			logger.Info("Endpoint IP found in VictoriaMetrics but not found in serviceEntryWeightsMap - can't set initial weight to weightOptimizer, continue without that pod", "IP", result.PodAddress)
 			continue
 		}
-		// Add the endpoint to the WeightOptimizer
-		weightOptimizer.Spec.Endpoints = append(weightOptimizer.Spec.Endpoints, optimizationv1alpha1.Endpoint{
+		spec.Endpoints = append(spec.Endpoints, optimizationv1alpha1.Endpoint{
 			ServiceName:      objectKey.Name,
 			ServiceNamespace: namespace,
 			IP:               result.PodAddress,
 			Name:             result.PodName,
-			Multiplier:       result.Multiplier,
-			Distance:         result.Distance,
-			Alpha:            result.Alpha,
 			Weight:           weight,
 			Optimized:        false,
+			Locality:         serviceEntryLocalityMap[result.PodAddress],
 			LastOptimized:    metav1.Time{Time: time.Now()},
 		})
 	}
@@ -624,78 +608,107 @@ func (r *WeightOptimizerReconciler) createWeightOptimizer(ctx context.Context, p
 	return weightOptimizer, nil
 }
 
-func (r *WeightOptimizerReconciler) adjustWeightsToMedian(weightsMap map[string]uint32, medianWeight uint32) map[string]uint32 {
-	if medianWeight == 0 {
-		return weightsMap // No adjustment needed if median is 0
+func getLocalityForMetric(endpoint *optimizationv1alpha1.Endpoint) string {
+	locality := endpoint.Locality
+	if locality == "" {
+		return "global"
 	}
-	// No adjustment needed if median is already 1000
-	middle := (r.MaximumWeight + r.MinimumWeight) / 2
-	if medianWeight == uint32(middle) {
-		return weightsMap
+	parts := strings.Split(locality, "/")
+	if len(parts) == 2 {
+		return parts[1]
 	}
-	// Calculate adjustment ratio using float for precision, then adjust each weight
-	adjustmentRatio := float64(middle) / float64(medianWeight)
-	adjustedWeightsMap := make(map[string]uint32)
-	for key, weight := range weightsMap {
-		adjustedWeight := uint32(float64(weight) * adjustmentRatio)
-		adjustedWeightsMap[key] = adjustedWeight
-	}
-
-	return adjustedWeightsMap
-}
-
-// helper function to calculate the median weight from a map of weights.
-func getMedianWeight(weightsMap map[string]uint32) uint32 {
-	weights := make([]uint32, 0, len(weightsMap))
-	for _, weight := range weightsMap {
-		weights = append(weights, weight)
-	}
-	// Sorting the slice of weights for median calculation
-	sort.Slice(weights, func(i, j int) bool { return weights[i] < weights[j] })
-
-	n := len(weights)
-	var median uint32
-	midIndex := n / 2
-
-	if n == 0 {
-		return 0 // If no weights, return 0
-	}
-
-	// Calculating median
-	if n%2 == 0 {
-		median = (weights[midIndex-1] + weights[midIndex]) / 2
-	} else {
-		median = weights[midIndex]
-	}
-	return median
-}
-
-// helper function to calculate the new weight based on the existing weight and a multiplier.
-func (r *WeightOptimizerReconciler) calculateNewWeight(currentWeight uint32, multiplier float64) uint32 {
-	// logger := log.FromContext(ctx).WithName(loggerName)
-	newWeight := float64(currentWeight) * multiplier
-
-	// Ensure the new weight is at least 100
-	if newWeight < float64(r.MinimumWeight) {
-		newWeight = float64(r.MinimumWeight)
-	}
-	// Ensure the new weight is at most 1995
-	if newWeight > float64(r.MaximumWeight) {
-		newWeight = float64(r.MaximumWeight)
-	}
-	return uint32(newWeight)
+	return locality
 }
 
 func (r *WeightOptimizerReconciler) updateMetrics(weightOptimizer *optimizationv1alpha1.WeightOptimizer, totalWeight float64) {
 	// logger.Info("Updating Prometheus metrics", "ServiceEntry", serviceEntry.Name, "IP", ep.IP, "ServiceName", ep.WeightOptimizer.ServiceName, "ServiceNamespace", ep.WeightOptimizer.ServiceNamespace)
 	for _, ep := range weightOptimizer.Spec.Endpoints {
-		customMetrics.AlphaMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.Alpha)
-		customMetrics.DistanceMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.Distance)
-		customMetrics.MultiplierMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.Multiplier)
-		customMetrics.ResponseTimeMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(ep.ResponseTime)
-		customMetrics.WeightMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(float64(ep.Weight))
-		customMetrics.NormalizedWeightMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace).Set(float64(ep.Weight) / totalWeight)
+		locality := getLocalityForMetric(&ep)
+		customMetrics.WeightMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace, locality).Set(float64(ep.Weight))
 	}
+}
+
+func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Context, podMetricsMap map[string]*PodMetrics, serviceEntryWeightsMap map[string]uint32, serviceEntryLocalityMap map[string]string) (map[string]uint32, error) {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	if len(podMetricsMap) == 0 {
+		return nil, fmt.Errorf("no metrics to process")
+	}
+
+	// Group pods by locality
+	groups := make(map[string][]*PodMetrics, len(podMetricsMap))
+	for _, podMetric := range podMetricsMap {
+		locality := serviceEntryLocalityMap[podMetric.PodAddress]
+		groups[locality] = append(groups[locality], podMetric)
+	}
+
+	// Process each locality group
+	for localityKey, groupPods := range groups {
+		logger.V(4).Info("Processing group", "localityKey", localityKey, "groupPods", groupPods)
+
+		// Calculate group total weight
+		var groupTotalWeight float64
+		for _, pm := range groupPods {
+			groupTotalWeight += float64(serviceEntryWeightsMap[pm.PodAddress])
+		}
+
+		// Check if group total weight is below minimum threshold
+		minGroupTotal := float64(len(groupPods)) * float64(r.MinimumWeight)
+		if groupTotalWeight < minGroupTotal {
+			for _, pm := range groupPods {
+				serviceEntryWeightsMap[pm.PodAddress] *= 10
+			}
+			continue
+		}
+
+		// Calculate average CPU for the group
+		var cpuTimes []float64
+		for _, pm := range groupPods {
+			cpuTimes = append(cpuTimes, pm.CPUTime)
+		}
+		avgCPU, _ := stats.Mean(cpuTimes)
+		if avgCPU < 0.20 {
+			// Set all to maximum if insufficient data
+			for _, pm := range groupPods {
+				serviceEntryWeightsMap[pm.PodAddress] = uint32(r.MaximumWeight)
+			}
+			continue
+		}
+		// Calculate X_sum for the "cake" formula
+		var xSum float64
+		for _, pm := range groupPods {
+			if pm.CPUTime > 0 {
+				xSum += avgCPU / pm.CPUTime * float64(serviceEntryWeightsMap[pm.PodAddress])
+			}
+		}
+
+		// Adjust weights for each pod in the group
+		scalingFactor := r.ScalingFactor
+		avgGroupWeight := groupTotalWeight / float64(len(groupPods))
+		for _, pm := range groupPods {
+			currentWeight := float64(serviceEntryWeightsMap[pm.PodAddress])
+			if currentWeight == 0 {
+				// TODO: its hack we need change the iteration to be based on the serviceEntryWeightsMap in next version.
+				logger.Info("Weight is 0, skipping", "PodAddress", pm.PodAddress, "PodName", pm.PodName)
+				continue
+			}
+			newShare := (avgCPU / pm.CPUTime) * (currentWeight / xSum) * groupTotalWeight
+			adjustedWeight := currentWeight + scalingFactor*(newShare-currentWeight)
+			// Cap big spikes
+			distance := adjustedWeight - currentWeight
+			maxAllowedDistance := avgGroupWeight / 4
+			if distance > maxAllowedDistance {
+				adjustedWeight = currentWeight + maxAllowedDistance
+			}
+			if adjustedWeight < 10 {
+				logger.Info("Adjusted weight is less than 10, setting it to 10 Weight optimization", "PodAddress", pm.PodAddress, "PodName", pm.PodName, "CPUTime", pm.CPUTime, "Weight", serviceEntryWeightsMap[pm.PodAddress], "NewShare", newShare, "AdjustedWeight", adjustedWeight, "Distance", distance, "MaxAllowedDistance", maxAllowedDistance, "avgCPU", avgCPU, "xSum", xSum, "scalingFactor", scalingFactor, "avgGroupWeight", avgGroupWeight, "currentWeight", currentWeight)
+				adjustedWeight = 10
+			}
+
+			serviceEntryWeightsMap[pm.PodAddress] = uint32(adjustedWeight)
+		}
+	}
+
+	return serviceEntryWeightsMap, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -41,6 +41,8 @@ spec:
             description: IstioAdaptiveRequestOptimizerSpec defines the desired state
               of IstioAdaptiveRequestOptimizer
             properties:
+              locality:
+                type: boolean
               service_name:
                 description: Name specifies the name of the service to optimize.
                 minLength: 1
@@ -67,6 +69,10 @@ spec:
                       - http
                       - grpc
                       type: string
+                    targetPort:
+                      description: TargetPort is the target port number of the service.
+                      format: int32
+                      type: integer
                   required:
                   - number
                   - protocol

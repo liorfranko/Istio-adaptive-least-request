@@ -29,6 +29,10 @@ type ServicePort struct {
 	// Only "HTTP", "gRPC", and "TCP" are supported.
 	// +kubebuilder:validation:Enum=http;grpc
 	Protocol string `json:"protocol"`
+
+	// TargetPort is the target port number of the service.
+	// +optional
+	TargetPort uint32 `json:"targetPort,omitempty"`
 }
 
 // ServiceEntry represents a basic info of a service entry created by the IstioAdaptiveRequestOptimizer controller.
@@ -58,6 +62,9 @@ type IstioAdaptiveRequestOptimizerSpec struct {
 	// Namespace specifies the namespace of the service.
 	// +optional
 	ServiceNamespace string `json:"service_namespace"`
+
+	// +optional
+	LocalityEnabled bool `json:"locality"`
 
 	// ServicePorts specifies a list of service ports, including port number and protocol. If empty, all ports are considered.
 	// +optional

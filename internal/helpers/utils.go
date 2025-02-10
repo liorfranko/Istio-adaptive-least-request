@@ -44,19 +44,14 @@ func NamespaceInFilteredList(namespace string, filteredNamespaces []string) bool
 	return false
 }
 
-func CleanupPodMetrics(serviceName string, serviceNamespace string, podName string, podIP string) int {
+func CleanupPodMetrics(serviceName string, serviceNamespace string, podName string, podIP string, locality string) int {
 	// Define Prometheus metrics to be removed
 	removedMetrics := 0
 	metricsToRemove := []*prometheus.GaugeVec{
-		customMetrics.AlphaMetric,
-		customMetrics.DistanceMetric,
-		customMetrics.MultiplierMetric,
 		customMetrics.WeightMetric,
-		customMetrics.ResponseTimeMetric,
-		customMetrics.NormalizedWeightMetric,
 	}
 	for _, metricVec := range metricsToRemove {
-		if !metricVec.Delete(prometheus.Labels{"service_name": serviceName, "service_namespace": serviceNamespace, "pod_name": podName, "pod_ip": podIP}) {
+		if !metricVec.Delete(prometheus.Labels{"service_name": serviceName, "service_namespace": serviceNamespace, "pod_name": podName, "pod_ip": podIP, "locality": locality}) {
 			continue
 		}
 		removedMetrics++

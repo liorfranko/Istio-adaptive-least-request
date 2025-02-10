@@ -33,10 +33,12 @@ type Endpoint struct {
 	Alpha            float64     `json:"alpha"`
 	Optimized        bool        `json:"optimized"`
 	LastOptimized    metav1.Time `json:"lastOptimized"`
+	Locality         string      `json:"locality"`
 }
 
 type WeightOptimizerSpec struct {
-	Endpoints []Endpoint `json:"endpoints,omitempty"`
+	Endpoints       []Endpoint `json:"endpoints,omitempty"`
+	LocalityEnabled bool       `json:"locality,omitempty"`
 }
 
 // WeightOptimizerStatus defines the observed state of WeightOptimizer
@@ -68,5 +70,5 @@ type WeightOptimizerList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&WeightOptimizer{}, &WeightOptimizerList{})
+	SchemeBuilder.Register((*WeightOptimizer)(nil), (*WeightOptimizerList)(nil))
 }
