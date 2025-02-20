@@ -3,6 +3,7 @@ package helpers
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
+	istioNetworkingV1 "istio.io/api/networking/v1"
 )
 
 // ContainsString checks if a string is present in a slice of strings.
@@ -44,17 +45,37 @@ func NamespaceInFilteredList(namespace string, filteredNamespaces []string) bool
 	return false
 }
 
-func CleanupPodMetrics(serviceName string, serviceNamespace string, podName string, podIP string, locality string) int {
+func CleanupPodMetrics(serviceNamespace string, serviceName string, podIP string, locality string) int {
 	// Define Prometheus metrics to be removed
 	removedMetrics := 0
 	metricsToRemove := []*prometheus.GaugeVec{
 		customMetrics.WeightMetric,
 	}
 	for _, metricVec := range metricsToRemove {
-		if !metricVec.Delete(prometheus.Labels{"service_name": serviceName, "service_namespace": serviceNamespace, "pod_name": podName, "pod_ip": podIP, "locality": locality}) {
+		if !metricVec.Delete(prometheus.Labels{"service_namespace": serviceNamespace, "service_name": serviceName, "pod_ip": podIP, "locality": locality}) {
 			continue
 		}
 		removedMetrics++
 	}
 	return removedMetrics
+}
+
+func Diff(desired []*istioNetworkingV1.WorkloadEntry, old []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
+	var diff []*istioNetworkingV1.WorkloadEntry
+	for _, endpoint := range old {
+		if !addressContains(desired, endpoint) {
+			diff = append(diff, endpoint)
+		}
+	}
+	return diff
+}
+
+// Contains endpoints with address []*istioNetworkingV1.WorkloadEntry
+func addressContains(items []*istioNetworkingV1.WorkloadEntry, item *istioNetworkingV1.WorkloadEntry) bool {
+	for _, i := range items {
+		if i.Address == item.Address {
+			return true
+		}
+	}
+	return false
 }

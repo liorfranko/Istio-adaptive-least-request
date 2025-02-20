@@ -3,16 +3,17 @@ package controller
 import (
 	"context"
 	"fmt"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+
 	"github.com/prometheus/client_golang/prometheus"
+
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
-	"k8s.io/apimachinery/pkg/util/intstr"
 
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
@@ -106,22 +107,15 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 		return ctrl.Result{}, err
 	}
 
-	// Collect the ports to process
-	portsToProcess := r.collectPortsToProcess(optimizer, service)
-	logger.V(1).Info("Ports to process", "Ports", portsToProcess)
-	var createdServiceEntries []*istioClientV1.ServiceEntry
-	for _, port := range portsToProcess {
-		// Create ServiceEntry using EndpointSlices
-		serviceEntry, err := r.createServiceEntry(ctx, service, port, endpointSliceList.Items, *optimizer)
-		if err != nil {
-			logger.Error(err, "Failed to create ServiceEntry for port", "Port", port.Port)
-			// TODO: Add a metric for failed ServiceEntry creation
-			continue // Skip this iteration on error
-		}
-		createdServiceEntries = append(createdServiceEntries, serviceEntry)
+	// Create ServiceEntry using EndpointSlices
+	serviceEntry, err := r.createServiceEntry(ctx, service, endpointSliceList.Items, optimizer)
+	if err != nil {
+		logger.Error(err, "Failed to create ServiceEntry for port")
+		// TODO: Add a metric for failed ServiceEntry creation
+		return ctrl.Result{}, err
 	}
 
-	if err := r.updateOptimizerStatus(ctx, optimizer, createdServiceEntries); err != nil {
+	if err := r.updateOptimizerStatus(ctx, optimizer, serviceEntry); err != nil {
 		// TODO: roman check why.
 		logger.Error(err, "Failed to update optimizer status with service entries")
 		return ctrl.Result{}, err
@@ -141,8 +135,12 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context
 
 // createServiceEntry constructs a ServiceEntry resource based on the provided Service, ServicePort, and EndpointSlices.
 // It then creates the ServiceEntry in the Kubernetes API server.
-func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, endpointSlices []discoveryv1.EndpointSlice, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1.ServiceEntry, error) {
+func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, endpointSlices []discoveryv1.EndpointSlice, opt *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1.ServiceEntry, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	if existServiceEntry := r.serviceEntryExists(ctx, service.Namespace, service.Name); existServiceEntry != nil {
+		//logger.Info("ServiceEntry already exists", "ServiceEntry", service.Name+"-"+fmt.Sprint(port.Port))
+		return existServiceEntry, nil
+	}
 	host := fmt.Sprintf("%s.%s.svc.cluster.local", service.Name, service.Namespace)
 
 	var serviceEntryEndpoints []*istioNetworkingV1.WorkloadEntry
@@ -153,7 +151,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 					Address: address,
 					Weight:  DefaultWeightForNewEndpoints,
 				}
-				if optimizer.Spec.LocalityEnabled {
+				if opt.Spec.LocalityEnabled {
 					if zonePtr := endpoint.Zone; zonePtr != nil {
 						zone := *zonePtr
 						workloadEntry.Locality = zone[:len(zone)-1] + "/" + zone
@@ -163,15 +161,6 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 			}
 		}
 	}
-
-	// Create the ServicePort for ServiceEntry
-	servicePort := &istioNetworkingV1.ServicePort{
-		Number:     uint32(port.Port),
-		Protocol:   helpers.SafeDereferenceAppProtocol(port.AppProtocol),
-		Name:       port.Name,
-		TargetPort: uint32(port.TargetPort.IntVal),
-	}
-
 	// Construct the ServiceEntry resource
 	serviceEntry := &istioClientV1.ServiceEntry{
 		TypeMeta: metav1.TypeMeta{
@@ -179,7 +168,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 			Kind:       "ServiceEntry",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      service.Name + "-" + fmt.Sprint(port.Port),
+			Name:      service.Name,
 			Namespace: service.Namespace,
 			Labels: map[string]string{
 				*r.ServiceEntryLabelKey:            "true",
@@ -187,30 +176,21 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
-					Name:       optimizer.Name,
-					APIVersion: optimizer.APIVersion,
-					Kind:       optimizer.Kind,
-					UID:        optimizer.UID,
+					Name:       opt.Name,
+					APIVersion: opt.APIVersion,
+					Kind:       opt.Kind,
+					UID:        opt.UID,
 				},
 			},
 		},
 		Spec: istioNetworkingV1.ServiceEntry{
-			Hosts: []string{host},
-			Ports: []*istioNetworkingV1.ServicePort{
-				servicePort,
-			},
-
+			Hosts:      []string{host},
 			Endpoints:  serviceEntryEndpoints,
 			Location:   istioNetworkingV1.ServiceEntry_MESH_INTERNAL,
 			Resolution: istioNetworkingV1.ServiceEntry_STATIC,
 		},
 	}
-
-	existServiceEntry := r.serviceEntryExists(ctx, service.Namespace, service.Name+"-"+fmt.Sprint(port.Port))
-	if existServiceEntry != nil {
-		//logger.Info("ServiceEntry already exists", "ServiceEntry", service.Name+"-"+fmt.Sprint(port.Port))
-		return existServiceEntry, nil
-	}
+	serviceEntry.Spec.Ports = coreServicePortsToIstioServicePorts(service.Spec.Ports, serviceEntry.Spec.Ports[:0])
 
 	// Create ServiceEntry resource
 	logger.Info("Creating ServiceEntry", "ServiceEntry", serviceEntry.Name)
@@ -221,6 +201,20 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 	}
 	logger.Info("ServiceEntry created successfully", "ServiceEntry", serviceEntry.Name)
 	return serviceEntry, nil
+}
+
+func coreServicePortsToIstioServicePorts(coreServicePorts []corev1.ServicePort, istioServicePorts []*istioNetworkingV1.ServicePort) []*istioNetworkingV1.ServicePort {
+	for i := range coreServicePorts {
+		port := &coreServicePorts[i]
+		istioServicePort := &istioNetworkingV1.ServicePort{
+			Number:     uint32(port.Port),
+			Protocol:   helpers.SafeDereferenceAppProtocol(port.AppProtocol),
+			Name:       port.Name,
+			TargetPort: uint32(port.TargetPort.IntValue()),
+		}
+		istioServicePorts = append(istioServicePorts, istioServicePort)
+	}
+	return istioServicePorts
 }
 
 // handleFinalizer handles the finalizer logic for the IstioAdaptiveRequestOptimizer resource
@@ -286,40 +280,6 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) removeFinalizer(ctx context.Co
 		}
 	}
 	return nil
-}
-
-// collectPortsToProcess returns the list of ServicePorts to process based on the optimizer spec and the Service.
-func (r *IstioAdaptiveRequestOptimizerReconciler) collectPortsToProcess(optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, service *corev1.Service) []corev1.ServicePort {
-	var portsToProcess []corev1.ServicePort
-	// TODO log and add a metric when the user adds a port that does not exist in the service
-	if len(optimizer.Spec.ServicePorts) > 0 {
-		optimizerPortsMap := make(map[string]optimizationv1alpha1.ServicePort)
-		for _, optimizerPort := range optimizer.Spec.ServicePorts {
-			// Normalize protocol to "TCP" for "HTTP" and "gRPC"
-			normalizedProtocol := normalizeProtocol(optimizerPort.Protocol)
-			portProtocolKey := fmt.Sprintf("%d/%s", optimizerPort.Number, normalizedProtocol)
-			optimizerPortsMap[portProtocolKey] = optimizerPort
-		}
-
-		for _, servicePort := range service.Spec.Ports {
-			// Ensure service port protocol is compared in a normalized form
-			normalizedServiceProtocol := normalizeProtocol(string(servicePort.Protocol))
-			portProtocolKey := fmt.Sprintf("%d/%s", servicePort.Port, normalizedServiceProtocol)
-			// Check if the service port matches an optimizer port
-			if optimizerPort, exists := optimizerPortsMap[portProtocolKey]; exists {
-				// If the optimizer port specifies a TargetPort, use it
-				if optimizerPort.TargetPort > 0 {
-					servicePort.TargetPort = intstr.FromInt(int(optimizerPort.TargetPort))
-				}
-				// Add the modified service port to the list of ports to process
-				portsToProcess = append(portsToProcess, servicePort)
-			}
-		}
-		return portsToProcess // Return early with the matched ports
-	}
-
-	// Default to using all ports from the service if no specific ports are defined in the optimizer
-	return service.Spec.Ports
 }
 
 // normalizeProtocol converts high-level protocol names to their underlying transport protocol.
@@ -454,19 +414,12 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificPodAnnotations(
 	return nil
 }
 
-func (r *IstioAdaptiveRequestOptimizerReconciler) updateOptimizerStatus(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntries []*istioClientV1.ServiceEntry) error {
-	var statusEntries []optimizationv1alpha1.ServiceEntry
-	for _, serviceEntry := range serviceEntries {
-		statusEntries = append(statusEntries, optimizationv1alpha1.ServiceEntry{
-			Name:         serviceEntry.Name,
-			Namespace:    serviceEntry.Namespace,
-			CreationTime: serviceEntry.CreationTimestamp,
-		})
-	}
-
-	// Properly update the optimizer status with the new slice
-	optimizer.Status.ServiceEntries = statusEntries
-
+func (r *IstioAdaptiveRequestOptimizerReconciler) updateOptimizerStatus(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntry *istioClientV1.ServiceEntry) error {
+	optimizer.Status.ServiceEntries = []optimizationv1alpha1.ServiceEntry{{
+		Name:         serviceEntry.Name,
+		Namespace:    serviceEntry.Namespace,
+		CreationTime: serviceEntry.CreationTimestamp,
+	}} // TODO(romang): change ServiceEntries to ServiceEntry
 	return r.Status().Update(ctx, optimizer)
 }
 

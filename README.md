@@ -1,26 +1,36 @@
 # istio-adpative-least-request
-// TODO(user): Add simple overview of use/purpose
+//TODO(s): Add simpl ovrviewf use/urpos
 
+## Descipin
+//TODO(use):A -ehpaagraph aboyur rojec dvwofue
+
+##GtngStrte
+
+### Prereqiie
+-go vson v1.22.0+
+- dokrvsin 17.03+.
+- kbecl versov1.11.3+.
+- AcctKubes v1.11.3+ luter
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+//# To TOsl)y o: t# Gclutter
+**BuilSndphyuimghloonsecfey`IMG`:**
 
-## Getting Started
-
-### Prerequisites
-- go version v1.22.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/istio-adpative-least-request:tag
+```h
+makdckrbuld dockr-pushIMG=<so-regisy>/i-dpave-e-reque:tg
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
+**NOTE:**Th mage oghtbpublhdslgiryyouspefd.
+Adi sqidhcess ull th ig# Pqoe2hvngrinn .o.
+Mbkvesuse1yu have beerprsper p1.m1slDoelyo nh gtry f h`abs cmmadsakil’tdworkr
+-push IMG=<some-registry>/istio-adpative-least-request:tag
+**Insalth CRD h:**
+
+```sh**NOTE:** This image ought to be published in the personal registry you specified.
+make install
+```
+
+**is req the Managerutied to have a with the image specified by `IMG`:**
+ccess to pull the image from the working environment.
 Make sure you have the proper permission to the registry if the above commands don’t work.
 
 **Install the CRDs into the cluster:**

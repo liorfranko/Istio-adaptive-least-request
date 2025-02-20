@@ -20,21 +20,23 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/montanaflynn/stats"
 	"github.com/prometheus/client_golang/prometheus"
-	"istio-adaptive-least-request/internal/helpers"
-	customMetrics "istio-adaptive-least-request/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"net/http"
-	"net/url"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"strconv"
-	"strings"
-	"time"
+
+	"istio-adaptive-least-request/internal/helpers"
+	customMetrics "istio-adaptive-least-request/internal/metrics"
 
 	//istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
@@ -56,12 +58,12 @@ type WeightOptimizerReconciler struct {
 	RequeueAfter                  time.Duration
 	MinimumWeight                 int
 	MaximumWeight                 int
-	NewEndpointsPercentileWeight  int
 	QueryInterval                 string
 	StepInterval                  string
 	MinOptimizeCpuDistancePercent float64
 	CpuDistanceMultiplierPercent  float64
-	ScalingFactor                 float64
+	ScaleupFactor                 float64
+	ScaledownFactor               float64
 }
 
 type VmdbCPURespone struct {
@@ -113,87 +115,86 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		logger.Info("IstioLatencyOptimizer is being deleted", "Namespace", istioOptimizer.Namespace, "Name", istioOptimizer.Name)
 		return ctrl.Result{}, nil
 	}
-	// Iterate over the service ports to process each one
-	for _, servicePort := range istioOptimizer.Spec.ServicePorts {
-		objectKey := client.ObjectKey{
-			Name:      fmt.Sprintf("%s-%d", istioOptimizer.Name, servicePort.Number),
-			Namespace: istioOptimizer.Namespace,
-		}
-		// Fetch the ServiceEntry for the port
-		var serviceEntry istionetworkingv1.ServiceEntry
-		if err := r.Get(ctx, objectKey, &serviceEntry); err != nil {
-			// If the ServiceEntry not found, log an error and continue to the next port
-			logger.Error(err, "ServiceEntry not exists, continue to the next port if there is", "ServiceEntry", serviceEntry.Name)
-			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetch_service_entry", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-			continue
-		}
-		logger.V(1).Info("Fetched ServiceEntry", "ServiceEntry", serviceEntry.Name)
+	objectKey := client.ObjectKey{
+		Name:      istioOptimizer.Name,
+		Namespace: istioOptimizer.Namespace,
+	}
+	// Fetch the ServiceEntry for the port
+	var serviceEntry istionetworkingv1.ServiceEntry
+	if err := r.Get(ctx, objectKey, &serviceEntry); err != nil {
+		// If the ServiceEntry not found, log an error and continue to the next port
+		logger.Error(err, "ServiceEntry not exists, continue to the next port if there is", "ServiceEntry", serviceEntry.Name)
+		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetch_service_entry", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
+		return ctrl.Result{}, err
+	}
+	logger.V(1).Info("Fetched ServiceEntry", "ServiceEntry", serviceEntry.Name)
 
-		// Create a map of the weights of the endpoints from the ServiceEntry
-		serviceEntryWeightsMap := r.getServiceEntryWeightMap(&serviceEntry)
-		serviceEntryLocalityMap := r.getServiceEntryLocalityMap(&serviceEntry)
+	// Create a map of the weights of the endpoints from the ServiceEntry
+	serviceEntryWeightsMap := r.getServiceEntryWeightMap(&serviceEntry)
+	serviceEntryLocalityMap := r.getServiceEntryLocalityMap(&serviceEntry)
 
-		if len(serviceEntry.Spec.Endpoints) == 0 {
-			logger.Info("ServiceEntry doesn't have any endpoints, continue", "ServiceEntry", serviceEntry.Name)
-			continue
-		}
+	if len(serviceEntry.Spec.Endpoints) == 0 {
+		logger.Info("ServiceEntry doesn't have any endpoints, continue", "ServiceEntry", serviceEntry.Name)
+		return ctrl.Result{RequeueAfter: r.RequeueAfter * time.Second}, nil
+	}
 
-		// create a map of pod ips and their names from pods ips
-		// Fetch pods using the selector
-		// C
-		podsInfo, err := r.listPods(ctx, istioOptimizer.Namespace, labels.SelectorFromSet(serviceEntry.Spec.Endpoints[0].Labels))
+	// create a map of pod ips and their names from pods ips
+	// Fetch pods using the selector
+	// C
+	labelsForPods := labels.SelectorFromSet(labels.Set{
+		"service.istio.io/canonical-name": istioOptimizer.Spec.ServiceName,
+	})
+	podsInfo, err := r.listPods(ctx, istioOptimizer.Namespace, labelsForPods)
+	if err != nil {
+		logger.Error(err, "Failed to list Pods", "Namespace", istioOptimizer.Namespace)
+		return ctrl.Result{}, err
+	}
+	//logger.V(1).Info("Pods fetched", "Pods", podsInfo)
+	// Get the metrics from VictoriaMetrics for the service and protocol
+	getPodMetricsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	podsMetrics, err := r.getPodMetrics(getPodMetricsCtx, istioOptimizer.Name, istioOptimizer.Namespace, podsInfo)
+	if err != nil {
+		// If there is a problem with pulling the metrics from VictoriaMetrics, log an error and continue to the next port
+		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "get_metrics_from_vm", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
+		err := r.fallbackStrategy(ctx, &istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap, podsInfo)
 		if err != nil {
-			logger.Error(err, "Failed to list Pods", "Namespace", istioOptimizer.Namespace)
+			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fallback_strategy", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
 			return ctrl.Result{}, err
 		}
-		//logger.V(1).Info("Pods fetched", "Pods", podsInfo)
-		// Get the metrics from VictoriaMetrics for the service and protocol
-		podsMetrics, err := r.getPodMetrics(ctx, istioOptimizer.Name, istioOptimizer.Namespace, podsInfo)
-		if err != nil {
-			// If there is a problem with pulling the metrics from VictoriaMetrics, log an error and continue to the next port
-			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "get_metrics_from_vm", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-			err := r.fallbackStrategy(ctx, &istioOptimizer, objectKey, servicePort, serviceEntryWeightsMap, serviceEntryLocalityMap, podsInfo)
-			if err != nil {
-				customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fallback_strategy", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-				return ctrl.Result{}, err
-			}
-			logger.Info("continue to the next port if there is", "service.Name", istioOptimizer.Name, "port", servicePort.Number)
-			continue
-		}
+		logger.Info("continue to the next port if there is", "service.Name", istioOptimizer.Name)
+		return ctrl.Result{}, err
+	}
 
-		// Update pod metrics based on the response from VictoriaMetrics
-		if err = r.updatePodMetrics(ctx, &podsMetrics); err != nil {
-			// If there is a problem with calculating the Alpha,Distance,Multiplier from VictoriaMetrics, log an error and continue to the next port
-			logger.Error(err, "Error calculating the Alpha,Distance,Multiplier based on the response from VictoriaMetrics, continue to the next port if there is", "service.Name", istioOptimizer.Name, "port", servicePort.Number)
-			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "update_pod_metrics", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-			continue
-		}
+	// Update pod metrics based on the response from VictoriaMetrics
+	if err = r.updatePodMetrics(ctx, &podsMetrics); err != nil {
+		// If there is a problem with calculating the Alpha,Distance,Multiplier from VictoriaMetrics, log an error and continue to the next port
+		logger.Error(err, "Error calculating the Alpha,Distance,Multiplier based on the response from VictoriaMetrics, continue to the next port if there is", "service.Name", istioOptimizer.Name)
+		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "update_pod_metrics", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
+		return ctrl.Result{}, err
+	}
 
-		// Fetch the WeightOptimizer for the port
-		weightOptimizer, err := r.ensureWeightOptimizer(ctx, &istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap)
-		if err != nil {
-			logger.Error(err, "Failed to ensure WeightOptimizer is available")
-			return ctrl.Result{}, err
-		}
+	// Fetch the WeightOptimizer for the port
+	weightOptimizer, err := r.ensureWeightOptimizer(ctx, &istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap)
+	if err != nil {
+		logger.Error(err, "Failed to ensure WeightOptimizer is available")
+		return ctrl.Result{}, err
+	}
 
-		newWeightsMap, err := r.distributeWeightsBasedOnCPU(ctx, podsMetrics, serviceEntryWeightsMap, serviceEntryLocalityMap)
-		updatedWeightOptimizer, totalWeight, err := r.calculateNewWeights(ctx, podsMetrics, newWeightsMap, istioOptimizer.Namespace, weightOptimizer, serviceEntryLocalityMap)
-		// Calculate the new weights based on the metrics
-		//updatedWeightOptimizer, totalWeight, err := r.calculateNewWeights(ctx, podsMetrics, serviceEntryWeightsMap, objectKey, istioOptimizer.Namespace, weightOptimizer)
-		if err != nil {
-			logger.Error(err, "Error calculating new weights, continue to the next port if there is", "service.Name", istioOptimizer.Name, "port", servicePort.Number)
-			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "calculate_new_weights", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-			continue
-		}
+	newWeightsMap, err := r.distributeWeightsBasedOnCPU(ctx, podsMetrics, serviceEntryWeightsMap, serviceEntryLocalityMap)
+	updatedWeightOptimizer, _, err := r.calculateNewWeights(ctx, podsMetrics, newWeightsMap, istioOptimizer.Namespace, weightOptimizer, serviceEntryLocalityMap)
+	// Calculate the new weights based on the metrics
+	//updatedWeightOptimizer, totalWeight, err := r.calculateNewWeights(ctx, podsMetrics, serviceEntryWeightsMap, objectKey, istioOptimizer.Namespace, weightOptimizer)
+	if err != nil {
+		logger.Error(err, "Error calculating new weights, continue to the next port if there is", "service.Name", istioOptimizer.Name)
+		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "calculate_new_weights", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
+		return ctrl.Result{}, err
+	}
 
-		// Update the WeightOptimizer resource with the updated weights and metrics
-		if err := r.Update(ctx, updatedWeightOptimizer); err != nil {
-			logger.Error(err, "Error updating WeightOptimizer, retry reconcile", "service.Name", istioOptimizer.Name, "port", servicePort.Number)
-			return ctrl.Result{}, err
-		}
-
-		// Update the metrics for the service
-		r.updateMetrics(updatedWeightOptimizer, totalWeight)
+	// Update the WeightOptimizer resource with the updated weights and metrics
+	if err := r.Update(ctx, updatedWeightOptimizer); err != nil {
+		logger.Error(err, "Error updating WeightOptimizer, retry reconcile", "service.Name", istioOptimizer.Name)
+		return ctrl.Result{}, err
 	}
 
 	// Requeue to process services periodically
@@ -357,8 +358,8 @@ func (r *WeightOptimizerReconciler) listPods(ctx context.Context, namespace stri
 }
 
 // fallbackStrategy checks if a fallback condition is met and resets weights if necessary.
-func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, objectKey client.ObjectKey, servicePort optimizationv1alpha1.ServicePort, serviceEntryWeightsMap map[string]uint32, serviceEntryLocalityMap map[string]string, podsInfo []PodInfo) error {
-	logger := log.FromContext(ctx).WithName(r.LoggerName).WithValues("service.name", istioOptimizer.Name, "service.namespace", istioOptimizer.Namespace, "port", servicePort.Number)
+func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, objectKey client.ObjectKey, serviceEntryWeightsMap map[string]uint32, serviceEntryLocalityMap map[string]string, podsInfo []PodInfo) error {
+	logger := log.FromContext(ctx).WithName(r.LoggerName).WithValues("service.name", istioOptimizer.Name, "service.namespace", istioOptimizer.Namespace)
 	logger.Info("Initiating fallback strategy check")
 
 	weightOptimizer, err := r.ensureWeightOptimizer(ctx, istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap)
@@ -531,22 +532,6 @@ func (r *WeightOptimizerReconciler) calculateNewWeights(ctx context.Context, pod
 		filteredEndpoints = append(filteredEndpoints, weightOptimizerEndpoint)
 	}
 
-	// Iterate over the endpoints in the WeightOptimizer and remove the metrics of the ones that are no longer exists in the VictoriaMetrics response
-	for _, weightOptimizerEndpoint := range weightOptimizer.Spec.Endpoints {
-		found := false
-		for _, filteredEndpoint := range filteredEndpoints {
-			if weightOptimizerEndpoint.IP == filteredEndpoint.IP {
-				found = true
-				break
-			}
-		}
-		if !found {
-			logger.V(1).Info("Endpoint exists in WeightOptimizer but not found in filteredEndpoint - deleting the metric", "IP", weightOptimizerEndpoint.IP)
-			// Remove the metrics of the endpoint that is no longer exists in the WeightOptimizer
-			removedMetrics := helpers.CleanupPodMetrics(weightOptimizerEndpoint.ServiceName, weightOptimizerEndpoint.ServiceNamespace, weightOptimizerEndpoint.Name, weightOptimizerEndpoint.IP, weightOptimizerEndpoint.Locality)
-			logger.V(1).Info("Number of metrics that removed is", "IP", weightOptimizerEndpoint.IP, "RemovedMetrics", removedMetrics)
-		}
-	}
 	weightOptimizer.Spec.Endpoints = filteredEndpoints
 
 	totalWeight := 0.0
@@ -608,26 +593,6 @@ func (r *WeightOptimizerReconciler) createWeightOptimizer(ctx context.Context, p
 	return weightOptimizer, nil
 }
 
-func getLocalityForMetric(endpoint *optimizationv1alpha1.Endpoint) string {
-	locality := endpoint.Locality
-	if locality == "" {
-		return "global"
-	}
-	parts := strings.Split(locality, "/")
-	if len(parts) == 2 {
-		return parts[1]
-	}
-	return locality
-}
-
-func (r *WeightOptimizerReconciler) updateMetrics(weightOptimizer *optimizationv1alpha1.WeightOptimizer, totalWeight float64) {
-	// logger.Info("Updating Prometheus metrics", "ServiceEntry", serviceEntry.Name, "IP", ep.IP, "ServiceName", ep.WeightOptimizer.ServiceName, "ServiceNamespace", ep.WeightOptimizer.ServiceNamespace)
-	for _, ep := range weightOptimizer.Spec.Endpoints {
-		locality := getLocalityForMetric(&ep)
-		customMetrics.WeightMetric.WithLabelValues(ep.Name, ep.IP, ep.ServiceName, ep.ServiceNamespace, locality).Set(float64(ep.Weight))
-	}
-}
-
 func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Context, podMetricsMap map[string]*PodMetrics, serviceEntryWeightsMap map[string]uint32, serviceEntryLocalityMap map[string]string) (map[string]uint32, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	if len(podMetricsMap) == 0 {
@@ -682,17 +647,25 @@ func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Cont
 		}
 
 		// Adjust weights for each pod in the group
-		scalingFactor := r.ScalingFactor
+		scaleupFactor := r.ScaleupFactor
+		scaledownFactor := r.ScaledownFactor
 		avgGroupWeight := groupTotalWeight / float64(len(groupPods))
 		for _, pm := range groupPods {
 			currentWeight := float64(serviceEntryWeightsMap[pm.PodAddress])
 			if currentWeight == 0 {
 				// TODO: its hack we need change the iteration to be based on the serviceEntryWeightsMap in next version.
 				logger.Info("Weight is 0, skipping", "PodAddress", pm.PodAddress, "PodName", pm.PodName)
+				serviceEntryWeightsMap[pm.PodAddress] = 10
 				continue
 			}
 			newShare := (avgCPU / pm.CPUTime) * (currentWeight / xSum) * groupTotalWeight
+			rawDistance := newShare - currentWeight
+			scalingFactor := scaleupFactor
+			if rawDistance < 0 {
+				scalingFactor = scaledownFactor
+			}
 			adjustedWeight := currentWeight + scalingFactor*(newShare-currentWeight)
+
 			// Cap big spikes
 			distance := adjustedWeight - currentWeight
 			maxAllowedDistance := avgGroupWeight / 4
@@ -700,7 +673,7 @@ func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Cont
 				adjustedWeight = currentWeight + maxAllowedDistance
 			}
 			if adjustedWeight < 10 {
-				logger.Info("Adjusted weight is less than 10, setting it to 10 Weight optimization", "PodAddress", pm.PodAddress, "PodName", pm.PodName, "CPUTime", pm.CPUTime, "Weight", serviceEntryWeightsMap[pm.PodAddress], "NewShare", newShare, "AdjustedWeight", adjustedWeight, "Distance", distance, "MaxAllowedDistance", maxAllowedDistance, "avgCPU", avgCPU, "xSum", xSum, "scalingFactor", scalingFactor, "avgGroupWeight", avgGroupWeight, "currentWeight", currentWeight)
+				logger.Info("Adjusted weight is less than 10, setting it to 10 Weight optimization", "PodAddress", pm.PodAddress, "PodName", pm.PodName, "CPUTime", pm.CPUTime, "Weight", serviceEntryWeightsMap[pm.PodAddress], "NewShare", newShare, "AdjustedWeight", adjustedWeight, "Distance", distance, "MaxAllowedDistance", maxAllowedDistance, "avgCPU", avgCPU, "xSum", xSum, "scaleupFactor", scaleupFactor, "scaledownFactor", scaledownFactor, "avgGroupWeight", avgGroupWeight, "currentWeight", currentWeight)
 				adjustedWeight = 10
 			}
 
