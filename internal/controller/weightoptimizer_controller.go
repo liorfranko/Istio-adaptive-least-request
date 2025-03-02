@@ -83,7 +83,6 @@ type PodMetrics struct {
 	PodName    string  `json:"podName"`
 	PodAddress string  `json:"podAddress"`
 	CPUTime    float64 `json:"cpuTime"`
-	Weight     uint32  `json:"weight"`
 }
 
 type PodCPUMetrics struct {
@@ -599,10 +598,15 @@ func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Cont
 		return nil, fmt.Errorf("no metrics to process")
 	}
 
-	// Group pods by locality
 	groups := make(map[string][]*PodMetrics, len(podMetricsMap))
-	for _, podMetric := range podMetricsMap {
-		locality := serviceEntryLocalityMap[podMetric.PodAddress]
+	for address := range serviceEntryWeightsMap {
+		locality := serviceEntryLocalityMap[address]
+		podMetric, ok := podMetricsMap[address]
+		if !ok {
+			podMetric = &PodMetrics{
+				PodAddress: address,
+			}
+		}
 		groups[locality] = append(groups[locality], podMetric)
 	}
 
@@ -617,10 +621,10 @@ func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Cont
 		}
 
 		// Check if group total weight is below minimum threshold
-		minGroupTotal := float64(len(groupPods)) * float64(r.MinimumWeight)
+		minGroupTotal := float64(len(groupPods)) * 200.0
 		if groupTotalWeight < minGroupTotal {
 			for _, pm := range groupPods {
-				serviceEntryWeightsMap[pm.PodAddress] *= 10
+				serviceEntryWeightsMap[pm.PodAddress] *= 5
 			}
 			continue
 		}
@@ -634,7 +638,7 @@ func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Cont
 		if avgCPU < 0.20 {
 			// Set all to maximum if insufficient data
 			for _, pm := range groupPods {
-				serviceEntryWeightsMap[pm.PodAddress] = uint32(r.MaximumWeight)
+				serviceEntryWeightsMap[pm.PodAddress] = 1000
 			}
 			continue
 		}
@@ -655,7 +659,7 @@ func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Cont
 			if currentWeight == 0 {
 				// TODO: its hack we need change the iteration to be based on the serviceEntryWeightsMap in next version.
 				logger.Info("Weight is 0, skipping", "PodAddress", pm.PodAddress, "PodName", pm.PodName)
-				serviceEntryWeightsMap[pm.PodAddress] = 10
+				serviceEntryWeightsMap[pm.PodAddress] = uint32(r.MinimumWeight)
 				continue
 			}
 			newShare := (avgCPU / pm.CPUTime) * (currentWeight / xSum) * groupTotalWeight
@@ -668,16 +672,26 @@ func (r *WeightOptimizerReconciler) distributeWeightsBasedOnCPU(ctx context.Cont
 
 			// Cap big spikes
 			distance := adjustedWeight - currentWeight
-			maxAllowedDistance := avgGroupWeight / 4
+			//maxAllowedDistance := avgGroupWeight / 4
+			maxAllowedDistance := 250.0
 			if distance > maxAllowedDistance {
 				adjustedWeight = currentWeight + maxAllowedDistance
 			}
-			if adjustedWeight < 10 {
-				logger.Info("Adjusted weight is less than 10, setting it to 10 Weight optimization", "PodAddress", pm.PodAddress, "PodName", pm.PodName, "CPUTime", pm.CPUTime, "Weight", serviceEntryWeightsMap[pm.PodAddress], "NewShare", newShare, "AdjustedWeight", adjustedWeight, "Distance", distance, "MaxAllowedDistance", maxAllowedDistance, "avgCPU", avgCPU, "xSum", xSum, "scaleupFactor", scaleupFactor, "scaledownFactor", scaledownFactor, "avgGroupWeight", avgGroupWeight, "currentWeight", currentWeight)
-				adjustedWeight = 10
+			if adjustedWeight < float64(r.MinimumWeight) {
+				logger.Info("Adjusted weight is less than minimumWeight, setting it to minimumWeight Weight optimization", "PodAddress", pm.PodAddress, "PodName", pm.PodName, "CPUTime", pm.CPUTime, "Weight", serviceEntryWeightsMap[pm.PodAddress], "NewShare", newShare, "AdjustedWeight", adjustedWeight, "Distance", distance, "MaxAllowedDistance", maxAllowedDistance, "avgCPU", avgCPU, "xSum", xSum, "scaleupFactor", scaleupFactor, "scaledownFactor", scaledownFactor, "avgGroupWeight", avgGroupWeight, "currentWeight", currentWeight, "minimumWeight", r.MinimumWeight)
+				adjustedWeight = float64(r.MinimumWeight)
 			}
 
 			serviceEntryWeightsMap[pm.PodAddress] = uint32(adjustedWeight)
+		}
+		// Normalize weights to keep the average weight equal to 1000
+		var totalWeight float64
+		for _, podMetrics := range groupPods {
+			totalWeight += float64(serviceEntryWeightsMap[podMetrics.PodAddress])
+		}
+		normalizationFactor := (1000 * float64(len(groupPods))) / totalWeight
+		for _, podMetrics := range groupPods {
+			serviceEntryWeightsMap[podMetrics.PodAddress] = uint32(float64(serviceEntryWeightsMap[podMetrics.PodAddress]) * normalizationFactor)
 		}
 	}
 

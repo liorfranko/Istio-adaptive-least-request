@@ -62,8 +62,17 @@ func CleanupPodMetrics(serviceNamespace string, serviceName string, podIP string
 
 func Diff(desired []*istioNetworkingV1.WorkloadEntry, old []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
 	var diff []*istioNetworkingV1.WorkloadEntry
+
+	// Find elements in old that are not in desired (removals)
 	for _, endpoint := range old {
 		if !addressContains(desired, endpoint) {
+			diff = append(diff, endpoint)
+		}
+	}
+
+	// Find elements in desired that are not in old (additions)
+	for _, endpoint := range desired {
+		if !addressContains(old, endpoint) {
 			diff = append(diff, endpoint)
 		}
 	}

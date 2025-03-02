@@ -71,7 +71,7 @@ func main() {
 	var namespaces string
 	var vmdbUrl string
 	var optimizeCycleTime int
-	var minimumWeight, maximumWeight int
+	var minimumWeight, maximumWeight, initialWeight int
 	var queryInterval, stepInterval string
 	var minOptimizeCpuDistancePercent, cpuDistanceMultiplierPercent float64
 	var newEndpointsPercentileWeight int
@@ -98,11 +98,12 @@ func main() {
 	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 30, "The time in seconds to run the optimization cycle")
 	flag.IntVar(&minimumWeight, "minimum-weight", 100, "The minimum weight for an endpoint to get, increasing this will make the split between the slowest and fastest endpoints smaller")
 	flag.IntVar(&maximumWeight, "maximum-weight", 600, "The maximum weight to use for the endpoints, decreasing this will make the split between the slowest and fastest endpoints smaller")
+	flag.IntVar(&initialWeight, "initial-weight", 400, "The initial weight to use for the endpoints, this value will be used for new endpoints")
 	// Define flags with percentage names
 	flag.Float64Var(&minOptimizeCpuDistancePercent, "min-optimize-cpu-distance-percent", 5.0, "The minimum distance percentage between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
 	flag.Float64Var(&cpuDistanceMultiplierPercent, "cpu-distance-multiplier-percent", 1.0, "The multiplier percentage to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplierPercent)")
 	flag.Float64Var(&scaleupFactor, "scale-up-factor", 0.15, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scaleupFactor")
-	flag.Float64Var(&scaledownFactor, "scale-down-factor", 0.45, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scaleupFactor")
+	flag.Float64Var(&scaledownFactor, "scale-down-factor", 0.15, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scaleupFactor")
 	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 10, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
 	flag.StringVar(&vmdbUrl, "vmdb-url", "http://ilo-vm-single-server:8428", "The URL of the VMDB service")
 
@@ -248,6 +249,7 @@ func main() {
 		NewEndpointsPercentileWeight:        newEndpointsPercentileWeight,
 		MaximumWeight:                       maximumWeight,
 		MinimumWeight:                       minimumWeight,
+		InitialWeight:                       initialWeight,
 	}).SetupWithManager(mgr, setupLog); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ServiceEntry")
 		os.Exit(1)

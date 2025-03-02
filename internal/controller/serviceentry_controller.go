@@ -20,6 +20,8 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -55,9 +57,44 @@ type ServiceEntryReconciler struct {
 	NewEndpointsPercentileWeight        int
 	MinimumWeight                       int
 	MaximumWeight                       int
+	InitialWeight                       int
 
 	//TODO: add dry run mode logic
 	//DryRun bool
+}
+
+type tKeyToMuxKey struct {
+	Namespace string
+	Name      string
+}
+
+type tMarkMux struct {
+	mux     sync.Mutex
+	touched int64
+}
+
+func (m *tMarkMux) checkTouchedAndReset() bool {
+	return atomic.SwapInt64(&m.touched, 0) > 0
+}
+
+var (
+	keyToMuxMux sync.Mutex
+	keyToMux    = make(map[tKeyToMuxKey]*tMarkMux)
+)
+
+func getMux(namespace, name string) *tMarkMux {
+	key := tKeyToMuxKey{
+		Namespace: namespace,
+		Name:      name,
+	}
+	keyToMuxMux.Lock()
+	defer keyToMuxMux.Unlock()
+	markMux, ok := keyToMux[key]
+	if !ok {
+		markMux = new(tMarkMux)
+		keyToMux[key] = markMux
+	}
+	return markMux
 }
 
 //+kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch
@@ -67,15 +104,21 @@ type ServiceEntryReconciler struct {
 //+kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch
 
 func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-
+	markMux := getMux(req.Namespace, req.Name)
+	if !markMux.mux.TryLock() {
+		atomic.AddInt64(&markMux.touched, 1)
+		return ctrl.Result{}, nil
+	}
+	defer markMux.mux.Unlock()
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile ServiceEntry", "ServiceEntry.Namespace", req.Namespace, "ServiceEntry.Name", req.Name)
-
 	// Step 1: Fetch the IstioAdaptiveRequestOptimizer object based on the request.
 	var istioAdaptiveRequestOptimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer
 	if err := r.Get(ctx, req.NamespacedName, &istioAdaptiveRequestOptimizer); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{
+			Requeue: markMux.checkTouchedAndReset(),
+		}, client.IgnoreNotFound(err)
 	}
 
 	// Step 2: Check for Endpoint updates.
@@ -83,28 +126,30 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if client.IgnoreNotFound(err) != nil {
 		logger.Error(err, "Failed to handle Endpoint update.")
 		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "handle_endpoint_update", "name": req.Name, "namespace": req.Namespace}).Inc()
-		return ctrl.Result{}, err
+		return ctrl.Result{
+			Requeue: markMux.checkTouchedAndReset(),
+		}, err
 	}
+	cleanupPodMetrics(oldWorkloads, istioAdaptiveRequestOptimizer.Spec.ServiceNamespace, req.Name)
 
 	// Step 3: Fetch the WeightOptimizer object based on the request.
 	var opt optimizationv1alpha1.WeightOptimizer
 	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
 		logger.Info("WeightOptimizer not found. No weight adjustments made.")
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{
+			Requeue: markMux.checkTouchedAndReset(),
+		}, client.IgnoreNotFound(err)
 	}
-	cleanupPodMetrics(oldWorkloads, istioAdaptiveRequestOptimizer.Spec.ServiceNamespace, req.Name)
 	// Step 4: Validate that the endpoints in the ServiceEntry match the current cluster state
 	if err := r.validateAndUpdateWeights(ctx, req, &opt); err != nil {
-		if errors.IsConflict(err) {
-			logger.Info("Got update event for endpoint need to wait new weight update")
-			// recue the request delay after 1 second
-			//return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-			return ctrl.Result{}, nil
-		}
 		logger.Error(err, "Failed to validate or update weights.")
-		return ctrl.Result{}, err
+		return ctrl.Result{
+			Requeue: markMux.checkTouchedAndReset(),
+		}, err
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{
+		Requeue: markMux.checkTouchedAndReset(),
+	}, nil
 }
 
 // handleEndpointUpdate checks for changes in the EndpointSlices and updates the ServiceEntry if necessary.
@@ -151,19 +196,19 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 		weightsByLocality[ep.Locality] = append(weightsByLocality[ep.Locality], ep.Weight)
 	}
 
-	// Calculate average weight for new endpoints.
-	logger.Info("Calculating average weight for new endpoints", "ExistingWeights", weightsByAddress)
+	// Calculate default weight for new endpoints.
+	logger.Info("Calculating default weight for new endpoints", "ExistingWeights", weightsByAddress)
 
-	averageWeightByLocality := make(map[string]uint32, len(weightsByLocality))
+	defaultWeightByLocality := make(map[string]uint32, len(weightsByLocality))
 
-	for locality, localityWeights := range weightsByLocality {
-		averageWeightByLocality[locality] = r.CreateDefaultWeightForNewEndpoints(localityWeights)
+	for locality, _ := range weightsByLocality {
+		defaultWeightByLocality[locality] = uint32(r.InitialWeight)
 	}
 
-	averageWeight := r.CreateDefaultWeightForNewEndpoints(allWeights)
-	logger.Info("Calculated average weight for new endpoints", "AverageWeight", averageWeight)
+	defaultWeight := uint32(r.InitialWeight)
+	logger.Info("Calculated default weight for new endpoints", "defaultWeight", defaultWeight)
 
-	// Aggregate endpoints from all EndpointSlices, assigning average weight to new ones.
+	// Aggregate endpoints from all EndpointSlices, assigning default weight to new ones.
 	mergedEndpoints := make([]*istioNetworkingV1.WorkloadEntry, 0)
 	for _, slice := range endpointSlices.Items {
 		for _, endpoint := range slice.Endpoints {
@@ -194,14 +239,14 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 
 			weight, ok := weightsByAddress[ip]
 			if !ok {
-				logger.Info("New endpoint detected entering the cluster with default weight", "IP", ip, "Weight", averageWeight)
+				logger.Info("New endpoint detected entering the cluster with default weight", "IP", ip, "Weight", defaultWeight)
 				if locality != "" {
-					weight, ok = averageWeightByLocality[locality]
+					weight, ok = defaultWeightByLocality[locality]
 					if !ok {
-						weight = averageWeight
+						weight = defaultWeight
 					}
 				} else {
-					weight = averageWeight // Assign the calculated average weight if new.
+					weight = defaultWeight // Assign the calculated default weight if new.
 				}
 			}
 
@@ -229,13 +274,18 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 	oldWorkloads := helpers.Diff(mergedEndpoints, serviceEntry.Spec.Endpoints)
 	//logger.Info("Detected endpoint changes", "ServiceEntry", serviceEntry.Name)
 
+	if len(oldWorkloads) == 0 {
+		logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
+		return nil, nil // No changes, no need to update.
+	}
 	// Update the ServiceEntry with the newly merged endpoints.
 	serviceEntry.Spec.Endpoints = mergedEndpoints
 	if err := r.Update(ctx, &serviceEntry); err != nil {
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		return nil, err // Return the error to retry
 	}
-	logger.Info("ServiceEntry updated successfully with dynamic weighting", "ServiceEntry", serviceEntry.Name)
+	updateMetrics(serviceEntry.Spec.Endpoints, serviceEntry.Namespace, serviceEntry.Name)
+	logger.Info("ServiceEntry updated handleEndpointUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
 	return oldWorkloads, nil
 }
 
@@ -283,18 +333,18 @@ func (r *ServiceEntryReconciler) validateAndUpdateWeights(ctx context.Context, r
 	}
 
 	// Update the ServiceEntry with the new weights
-	logger.Info("ServiceEntry updated with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
 	if err := r.Update(ctx, &serviceEntry); err != nil {
 		if errors.IsConflict(err) {
-			logger.Info("ServiceEntry has been modified. Requeueing.")
-			return err
+			logger.Error(err, "Got conflict when tried to update ServiceEntry")
+		} else {
+			logger.Error(err, "Failed to update ServiceEntry weights.")
 		}
-		logger.Error(err, "Failed to update ServiceEntry weights.")
 		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "validate_and_update_weights", "name": req.Name, "namespace": req.Namespace}).Inc()
 		return err
 	}
 	// Update the metrics for the service
 	updateMetrics(serviceEntry.Spec.Endpoints, serviceEntry.Namespace, serviceEntry.Name)
+	logger.Info("ServiceEntry updated validateAndUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
 
 	return nil // Return true indicating weights were updated.
 }
@@ -358,7 +408,7 @@ func (r *ServiceEntryReconciler) CreateDefaultWeightForNewEndpoints(weights []ui
 		sum += weights[i]
 	}
 
-	// Calculate the average of the lowest newEndpointsPercentileWeight
+	// Calculate the default of the lowest newEndpointsPercentileWeight
 	return sum / uint32(n)
 }
 
