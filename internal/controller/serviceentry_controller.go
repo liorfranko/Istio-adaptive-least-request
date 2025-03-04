@@ -29,6 +29,7 @@ import (
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -96,6 +97,15 @@ func getMux(namespace, name string) *tMarkMux {
 	return markMux
 }
 
+func tryLock(name types.NamespacedName) (bool, func()) {
+	markMux := getMux(name.Namespace, name.Name)
+	if !markMux.mux.TryLock() {
+		atomic.AddInt64(&markMux.touched, 1)
+		return false, nil
+	}
+	return true, markMux.mux.Unlock
+}
+
 //+kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=serviceentries,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=serviceentries/status,verbs=get;update;patch
@@ -103,6 +113,12 @@ func getMux(namespace, name string) *tMarkMux {
 //+kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch
 
 func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	ok, unlock := tryLock(req.NamespacedName)
+	if !ok {
+		return ctrl.Result{}, nil
+	}
+	defer unlock()
+
 	markMux := getMux(req.Namespace, req.Name)
 	if !markMux.mux.TryLock() {
 		atomic.AddInt64(&markMux.touched, 1)
@@ -112,8 +128,8 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile ServiceEntry", "ServiceEntry.Namespace", req.Namespace, "ServiceEntry.Name", req.Name)
 	// Step 1: Fetch the IstioAdaptiveRequestOptimizer object based on the request.
-	var istioAdaptiveRequestOptimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer
-	if err := r.Get(ctx, req.NamespacedName, &istioAdaptiveRequestOptimizer); err != nil {
+	var opt optimizationv1alpha1.IstioAdaptiveRequestOptimizer
+	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
 		return ctrl.Result{
 			Requeue: markMux.checkTouchedAndReset(),
@@ -121,7 +137,7 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Step 2: Check for Endpoint updates.
-	oldWorkloads, err := r.handleEndpointUpdate(ctx, req, &istioAdaptiveRequestOptimizer)
+	oldWorkloads, err := r.handleEndpointUpdate(ctx, req, &opt)
 	if client.IgnoreNotFound(err) != nil {
 		logger.Error(err, "Failed to handle Endpoint update.")
 		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "handle_endpoint_update", "name": req.Name, "namespace": req.Namespace}).Inc()
@@ -129,7 +145,7 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			Requeue: markMux.checkTouchedAndReset(),
 		}, err
 	}
-	cleanupPodMetrics(oldWorkloads, istioAdaptiveRequestOptimizer.Spec.ServiceNamespace, req.Name)
+	cleanupPodMetrics(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
 	return ctrl.Result{
 		Requeue: markMux.checkTouchedAndReset(),
 	}, nil
@@ -169,76 +185,53 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 		return nil, err // No endpoints to process
 	}
 
-	// Track existing endpoint allWeights.
-	weightsByAddress := make(map[string]uint32)
-	var allWeights []uint32
-	weightsByLocality := map[string][]uint32{}
-	for _, ep := range serviceEntry.Spec.Endpoints {
-		weightsByAddress[ep.Address] = ep.Weight
-		allWeights = append(allWeights, ep.Weight)
-		weightsByLocality[ep.Locality] = append(weightsByLocality[ep.Locality], ep.Weight)
-	}
-
-	// Calculate default weight for new endpoints.
-	logger.Info("Calculating default weight for new endpoints", "ExistingWeights", weightsByAddress)
-
-	defaultWeightByLocality := make(map[string]uint32, len(weightsByLocality))
-
-	for locality, _ := range weightsByLocality {
-		defaultWeightByLocality[locality] = uint32(r.InitialWeight)
+	addressToWorkloadEntry := make(map[string]*istioNetworkingV1.WorkloadEntry)
+	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
+		addressToWorkloadEntry[workloadEntry.Address] = workloadEntry
 	}
 
 	defaultWeight := uint32(r.InitialWeight)
 	logger.Info("Calculated default weight for new endpoints", "defaultWeight", defaultWeight)
 
 	// Aggregate endpoints from all EndpointSlices, assigning default weight to new ones.
-	mergedEndpoints := make([]*istioNetworkingV1.WorkloadEntry, 0)
-	for _, slice := range endpointSlices.Items {
-		for _, endpoint := range slice.Endpoints {
-			// Prefer the IPv4 address; fallback to IPv6 if necessary
-
-			if endpoint.Conditions.Ready == nil || !*endpoint.Conditions.Ready {
+	existAddresses := make(map[string]struct{})
+	newWorkloadEntries := make([]*istioNetworkingV1.WorkloadEntry, 0)
+	localityEnabled := opt.Spec.LocalityEnabled
+	for _, endpointSlice := range endpointSlices.Items {
+		for _, endpoint := range endpointSlice.Endpoints {
+			if readyPtr := endpoint.Conditions.Ready; readyPtr == nil || !*readyPtr {
 				logger.Info("Endpoint is not ready", "Endpoint", endpoint)
 				continue
 			}
-
-			var ip string
-			if len(endpoint.Addresses) > 0 {
-				ip = endpoint.Addresses[0]
+			var address string
+			if addresses := endpoint.Addresses; len(addresses) > 0 {
+				address = addresses[0]
 			}
-			if ip == "" {
-				continue // Skip endpoints without an IP address
+			if address == "" {
+				// TODO(romang): check why this happens, if it is
+				continue
 			}
-
+			if _, ok := existAddresses[address]; ok {
+				// Skip duplicate endpoints
+				// https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/#duplicate-endpoints
+				continue
+			}
+			existAddresses[address] = struct{}{}
+			workloadEntry, ok := addressToWorkloadEntry[address]
+			if !ok {
+				workloadEntry = &istioNetworkingV1.WorkloadEntry{
+					Address: address,
+					Weight:  defaultWeight,
+				}
+			}
 			var locality string
-
-			if opt.Spec.LocalityEnabled {
-				// Safely handle the *string for zone:
+			if localityEnabled {
 				if zonePtr := endpoint.Zone; zonePtr != nil {
 					locality = *zonePtr
-					locality = locality[:len(locality)-1] + "/" + locality
+					workloadEntry.Locality = locality[:len(locality)-1] + "/" + locality
 				}
 			}
-
-			weight, ok := weightsByAddress[ip]
-			if !ok {
-				logger.Info("New endpoint detected entering the cluster with default weight", "IP", ip, "Weight", defaultWeight)
-				if locality != "" {
-					weight, ok = defaultWeightByLocality[locality]
-					if !ok {
-						weight = defaultWeight
-					}
-				} else {
-					weight = defaultWeight // Assign the calculated default weight if new.
-				}
-			}
-
-			mergedEndpoints = append(mergedEndpoints, &istioNetworkingV1.WorkloadEntry{
-				Address: ip,
-				Weight:  weight,
-				// Capture the zone/locality information for this endpoint.
-				Locality: locality,
-			})
+			newWorkloadEntries = append(newWorkloadEntries, workloadEntry)
 		}
 	}
 
@@ -247,29 +240,29 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 		logger.Error(err, "Failed to fetch Service.")
 		return nil, err
 	}
-	serviceEntry.Spec.Ports = coreServicePortsToIstioServicePorts(coreService.Spec.Ports, serviceEntry.Spec.Ports[:0])
+	serviceEntry.Spec.Ports = appendCoreServicePortsToIstioServicePorts(serviceEntry.Spec.Ports[:0], coreService.Spec.Ports)
 
 	// Check if updates are required based on endpoint changes.
-	//if !(addressesChanged(serviceEntry.Spec.Endpoints, mergedEndpoints) || checkPortsChanged(serviceEntry.Spec.Ports, service.Spec.ServicePorts)) {
+	//if !(addressesChanged(serviceEntry.Spec.Endpoints, newWorkloadEntries) || checkPortsChanged(serviceEntry.Spec.Ports, service.Spec.ServicePorts)) {
 	//	logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
 	//	return nil, err // No changes, no need to update.
 	//}
-	oldWorkloads := helpers.Diff(mergedEndpoints, serviceEntry.Spec.Endpoints)
+	workloadEntriesDiff := helpers.Diff(nil, newWorkloadEntries, serviceEntry.Spec.Endpoints)
 	//logger.Info("Detected endpoint changes", "ServiceEntry", serviceEntry.Name)
 
-	if len(oldWorkloads) == 0 {
+	if len(workloadEntriesDiff) == 0 {
 		logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
 		return nil, nil // No changes, no need to update.
 	}
 	// Update the ServiceEntry with the newly merged endpoints.
-	serviceEntry.Spec.Endpoints = mergedEndpoints
+	serviceEntry.Spec.Endpoints = newWorkloadEntries
 	if err := r.Update(ctx, &serviceEntry); err != nil {
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		return nil, err // Return the error to retry
 	}
 	updateMetrics(&serviceEntry)
 	logger.Info("ServiceEntry updated handleEndpointUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
-	return oldWorkloads, nil
+	return workloadEntriesDiff, nil
 }
 
 func checkPortsChanged(istioPorts []*istioNetworkingV1.ServicePort, optPorts []optimizationv1alpha1.ServicePort) bool {
@@ -292,24 +285,16 @@ func checkPortsChanged(istioPorts []*istioNetworkingV1.ServicePort, optPorts []o
 func updateMetrics(serviceEntry *istioClientV1.ServiceEntry) {
 	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
 		podAddress := workloadEntry.Address
-		podZone := ""
-		if zonePtr := workloadEntry.Locality; zonePtr != "" {
-			podZone = zonePtr
-			podZone = getLocalityForMetric(podZone)
-		}
+		podZone := getLocalityForMetric(workloadEntry.Locality)
 		podWeight := workloadEntry.Weight
 		customMetrics.WeightMetric.WithLabelValues(serviceEntry.Namespace, serviceEntry.Name, podAddress, podZone).Set(float64(podWeight))
 	}
 }
 
-func cleanupPodMetrics(oldWorkloads []*istioNetworkingV1.WorkloadEntry, serviceEntryNamespace string, serviceEntryName string) {
-	for _, workload := range oldWorkloads {
-		podAddress := workload.Address
-		podZone := ""
-		if zonePtr := workload.Locality; zonePtr != "" {
-			podZone = zonePtr
-			podZone = getLocalityForMetric(podZone)
-		}
+func cleanupPodMetrics(oldWorkloadEntries []*istioNetworkingV1.WorkloadEntry, serviceEntryNamespace, serviceEntryName string) {
+	for _, workloadEntry := range oldWorkloadEntries {
+		podAddress := workloadEntry.Address
+		podZone := getLocalityForMetric(workloadEntry.Locality)
 		helpers.CleanupPodMetrics(serviceEntryNamespace, serviceEntryName, podAddress, podZone)
 	}
 }

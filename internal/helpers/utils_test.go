@@ -1,18 +1,19 @@
 package helpers
 
 import (
-	istioNetworkingV1 "istio.io/api/networking/v1"
 	"testing"
+
+	istioNetworkingV1 "istio.io/api/networking/v1"
 )
 
 func TestDiff(t *testing.T) {
 	slice := []*istioNetworkingV1.WorkloadEntry{{Address: "a"}, {Address: "b"}, {Address: "c"}, {Address: "k"}}
 	slice2 := []*istioNetworkingV1.WorkloadEntry{{Address: "a"}, {Address: "b"}, {Address: "c"}, {Address: "d"}, {Address: "e"}}
-	diff := Diff(slice, slice2)
+	diff := Diff(nil, slice, slice2)
 	if len(diff) != 3 {
 		t.Errorf("Expected 2, got %d", len(diff))
 	}
-	diff2 := Diff(slice2, slice)
+	diff2 := Diff(nil, slice2, slice)
 	if len(diff2) != 3 {
 		t.Errorf("Expected 2, got %d", len(diff2))
 	}

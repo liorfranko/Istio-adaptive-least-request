@@ -2,38 +2,27 @@ package helpers
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
-	customMetrics "istio-adaptive-least-request/internal/metrics"
 	istioNetworkingV1 "istio.io/api/networking/v1"
+
+	customMetrics "istio-adaptive-least-request/internal/metrics"
 )
 
-// ContainsString checks if a string is present in a slice of strings.
-func ContainsString(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
-	}
-	return false
-}
-
-// RemoveString removes a string from a slice of strings.
-func RemoveString(slice []string, s string) []string {
-	var result []string
+func Remove[T comparable](dst, slice []T, s T) []T {
 	for _, item := range slice {
 		if item != s {
-			result = append(result, item)
+			dst = append(dst, item)
 		}
 	}
-	return result
+	return dst
 }
 
 // SafeDereferenceAppProtocol safely dereferences a pointer to a string (appProtocol).
 // It returns the dereference string if it's not nil, or a default value (e.g., "TCP") if it's nil.
-func SafeDereferenceAppProtocol(appProtocol *string) string {
-	if appProtocol != nil {
-		return *appProtocol
+func SafeDereferenceAppProtocol(appProtocolPtr *string) string {
+	if appProtocolPtr != nil {
+		return *appProtocolPtr
 	}
-	return "TCP" // or some default value if protocol isn't specified
+	return "TCP"
 }
 
 func NamespaceInFilteredList(namespace string, filteredNamespaces []string) bool {
@@ -60,29 +49,26 @@ func CleanupPodMetrics(serviceNamespace string, serviceName string, podIP string
 	return removedMetrics
 }
 
-func Diff(desired []*istioNetworkingV1.WorkloadEntry, old []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
-	var diff []*istioNetworkingV1.WorkloadEntry
-
-	// Find elements in old that are not in desired (removals)
-	for _, endpoint := range old {
-		if !addressContains(desired, endpoint) {
-			diff = append(diff, endpoint)
+func diff1(dst, a, b []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
+	for _, workloadEntry := range a {
+		if !addressContains(b, workloadEntry) {
+			dst = append(dst, workloadEntry)
 		}
 	}
-
-	// Find elements in desired that are not in old (additions)
-	for _, endpoint := range desired {
-		if !addressContains(old, endpoint) {
-			diff = append(diff, endpoint)
-		}
-	}
-	return diff
+	return dst
 }
 
-// Contains endpoints with address []*istioNetworkingV1.WorkloadEntry
-func addressContains(items []*istioNetworkingV1.WorkloadEntry, item *istioNetworkingV1.WorkloadEntry) bool {
-	for _, i := range items {
-		if i.Address == item.Address {
+func Diff(dst, desired, actual []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
+	// Find elements in actual that are not in desired (removals)
+	dst = diff1(dst, actual, desired)
+	// Find elements in desired that are not in actual (additions)
+	dst = diff1(dst, desired, actual)
+	return dst
+}
+
+func addressContains(workloadEntries []*istioNetworkingV1.WorkloadEntry, targetWorkloadEntry *istioNetworkingV1.WorkloadEntry) bool {
+	for _, workloadEntry := range workloadEntries {
+		if workloadEntry.Address == targetWorkloadEntry.Address {
 			return true
 		}
 	}

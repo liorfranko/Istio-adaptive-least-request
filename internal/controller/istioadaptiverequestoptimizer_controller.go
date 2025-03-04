@@ -193,12 +193,11 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 			Resolution: istioNetworkingV1.ServiceEntry_STATIC,
 		},
 	}
-	serviceEntry.Spec.Ports = coreServicePortsToIstioServicePorts(service.Spec.Ports, serviceEntry.Spec.Ports[:0])
+	serviceEntry.Spec.Ports = appendCoreServicePortsToIstioServicePorts(serviceEntry.Spec.Ports[:0], service.Spec.Ports)
 
 	// Create ServiceEntry resource
-	logger.Info("Creating ServiceEntry", "ServiceEntry", serviceEntry.Name)
-	err := r.Create(ctx, serviceEntry)
-	if err != nil {
+	logger.Info("Try to create ServiceEntry", "ServiceEntry", serviceEntry.Name)
+	if err := r.Create(ctx, serviceEntry); err != nil {
 		logger.Error(err, "Failed to create ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		return nil, err
 	}
@@ -206,7 +205,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context
 	return serviceEntry, nil
 }
 
-func coreServicePortsToIstioServicePorts(coreServicePorts []corev1.ServicePort, istioServicePorts []*istioNetworkingV1.ServicePort) []*istioNetworkingV1.ServicePort {
+func appendCoreServicePortsToIstioServicePorts(istioServicePorts []*istioNetworkingV1.ServicePort, coreServicePorts []corev1.ServicePort) []*istioNetworkingV1.ServicePort {
 	for i := range coreServicePorts {
 		port := &coreServicePorts[i]
 		istioServicePort := &istioNetworkingV1.ServicePort{
@@ -225,7 +224,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) handleFinalizer(ctx context.Co
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 
 	// If the resource is marked for deletion
-	if helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
+	if slices.Contains(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
 		if err := r.cleanupSpecificEndpointSliceAnnotations(ctx, optimizer, []string{*r.EndpointsAnnotationKey}); err != nil {
 			if !errors.IsNotFound(err) {
 				logger.Error(err, "Error cleaning up specific EndpointSlice annotations")
@@ -256,31 +255,32 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) handleFinalizer(ctx context.Co
 
 // addFinalizer adds the finalizer to the IstioAdaptiveRequestOptimizer
 func (r *IstioAdaptiveRequestOptimizerReconciler) addFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
-	if !helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
-		logger := log.FromContext(ctx).WithName(r.LoggerName)
-		logger.Info("Adding Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-		optimizer.SetFinalizers(append(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer))
-		// Update CR to add finalizer
-		if err := r.Update(ctx, optimizer); err != nil {
-			logger.Error(err, "Failed to add finalizer to IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-			return err
-		}
+	finalizers := optimizer.Finalizers
+	if slices.Contains(finalizers, istioAdaptiveRequestOptimizerFinalizer) {
+		return nil
+	}
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	logger.Info("Adding Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+	optimizer.Finalizers = append(finalizers, istioAdaptiveRequestOptimizerFinalizer)
+	if err := r.Update(ctx, optimizer); err != nil {
+		logger.Error(err, "Failed to add finalizer to IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
+		return err
 	}
 	return nil
 }
 
 // removeFinalizer removes the finalizer from the IstioAdaptiveRequestOptimizer
-func (r *IstioAdaptiveRequestOptimizerReconciler) removeFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
-	if helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
-		logger := log.FromContext(ctx).WithName(r.LoggerName)
-		logger.Info("Removing Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-		optimizer.SetFinalizers(helpers.RemoveString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer))
-
-		// Update CR to remove the finalizer
-		if err := r.Update(ctx, optimizer); err != nil {
-			logger.Error(err, "Failed to remove finalizer from IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-			return err
-		}
+func (r *IstioAdaptiveRequestOptimizerReconciler) removeFinalizer(ctx context.Context, opt *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
+	finalizers := opt.Finalizers
+	if !slices.Contains(finalizers, istioAdaptiveRequestOptimizerFinalizer) {
+		return nil
+	}
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	logger.Info("Removing Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", opt.Name)
+	opt.Finalizers = helpers.Remove(nil, finalizers, istioAdaptiveRequestOptimizerFinalizer)
+	if err := r.Update(ctx, opt); err != nil {
+		logger.Error(err, "Failed to remove finalizer from IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", opt.Name)
+		return err
 	}
 	return nil
 }
