@@ -29,7 +29,6 @@ import (
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -131,22 +130,6 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}, err
 	}
 	cleanupPodMetrics(oldWorkloads, istioAdaptiveRequestOptimizer.Spec.ServiceNamespace, req.Name)
-
-	// Step 3: Fetch the WeightOptimizer object based on the request.
-	var opt optimizationv1alpha1.WeightOptimizer
-	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
-		logger.Info("WeightOptimizer not found. No weight adjustments made.")
-		return ctrl.Result{
-			Requeue: markMux.checkTouchedAndReset(),
-		}, client.IgnoreNotFound(err)
-	}
-	// Step 4: Validate that the endpoints in the ServiceEntry match the current cluster state
-	if err := r.validateAndUpdateWeights(ctx, req, &opt); err != nil {
-		logger.Error(err, "Failed to validate or update weights.")
-		return ctrl.Result{
-			Requeue: markMux.checkTouchedAndReset(),
-		}, err
-	}
 	return ctrl.Result{
 		Requeue: markMux.checkTouchedAndReset(),
 	}, nil
@@ -284,7 +267,7 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		return nil, err // Return the error to retry
 	}
-	updateMetrics(serviceEntry.Spec.Endpoints, serviceEntry.Namespace, serviceEntry.Name)
+	updateMetrics(&serviceEntry)
 	logger.Info("ServiceEntry updated handleEndpointUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
 	return oldWorkloads, nil
 }
@@ -306,59 +289,16 @@ func checkPortsChanged(istioPorts []*istioNetworkingV1.ServicePort, optPorts []o
 	return false
 }
 
-// validateAndUpdateWeights checks if endpoints match the expected state and updates weights if necessary.
-func (r *ServiceEntryReconciler) validateAndUpdateWeights(ctx context.Context, req ctrl.Request, optWeight *optimizationv1alpha1.WeightOptimizer) error {
-	logger := log.FromContext(ctx).WithName(r.LoggerName)
-
-	// Fetch the specific ServiceEntry.
-	var serviceEntry istioClientV1.ServiceEntry
-	if err := r.Get(ctx, req.NamespacedName, &serviceEntry); client.IgnoreNotFound(err) != nil {
-		logger.Error(err, "Failed to fetch ServiceEntry.")
-		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetch_service_entry", "name": req.Name, "namespace": req.Namespace}).Inc()
-		return err
-	}
-
-	// Create weightsMap to store the weights of the endpoints
-	weightsMap := make(map[string]uint32)
-	endpoints := optWeight.Spec.Endpoints
-	for i := range endpoints {
-		endpoint := &endpoints[i]
-		weightsMap[endpoint.IP] = endpoint.Weight
-	}
+func updateMetrics(serviceEntry *istioClientV1.ServiceEntry) {
 	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
-		weight, ok := weightsMap[workloadEntry.Address]
-		if ok {
-			workloadEntry.Weight = weight
-		}
-	}
-
-	// Update the ServiceEntry with the new weights
-	if err := r.Update(ctx, &serviceEntry); err != nil {
-		if errors.IsConflict(err) {
-			logger.Error(err, "Got conflict when tried to update ServiceEntry")
-		} else {
-			logger.Error(err, "Failed to update ServiceEntry weights.")
-		}
-		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "validate_and_update_weights", "name": req.Name, "namespace": req.Namespace}).Inc()
-		return err
-	}
-	// Update the metrics for the service
-	updateMetrics(serviceEntry.Spec.Endpoints, serviceEntry.Namespace, serviceEntry.Name)
-	logger.Info("ServiceEntry updated validateAndUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
-
-	return nil // Return true indicating weights were updated.
-}
-
-func updateMetrics(workloads []*istioNetworkingV1.WorkloadEntry, serviceEntryNamespace string, serviceEntryName string) {
-	for _, workload := range workloads {
-		podAddress := workload.Address
+		podAddress := workloadEntry.Address
 		podZone := ""
-		if zonePtr := workload.Locality; zonePtr != "" {
+		if zonePtr := workloadEntry.Locality; zonePtr != "" {
 			podZone = zonePtr
 			podZone = getLocalityForMetric(podZone)
 		}
-		podWeight := workload.Weight
-		customMetrics.WeightMetric.WithLabelValues(serviceEntryNamespace, serviceEntryName, podAddress, podZone).Set(float64(podWeight))
+		podWeight := workloadEntry.Weight
+		customMetrics.WeightMetric.WithLabelValues(serviceEntry.Namespace, serviceEntry.Name, podAddress, podZone).Set(float64(podWeight))
 	}
 }
 
@@ -410,25 +350,6 @@ func (r *ServiceEntryReconciler) CreateDefaultWeightForNewEndpoints(weights []ui
 
 	// Calculate the default of the lowest newEndpointsPercentileWeight
 	return sum / uint32(n)
-}
-
-func addressesChanged(existingEndpoints, newEndpoints []*istioNetworkingV1.WorkloadEntry) bool {
-	if len(existingEndpoints) != len(newEndpoints) {
-		return true // Different number of endpoints
-	}
-
-	existingAddresses := make(map[string]bool)
-	for _, endpoint := range existingEndpoints {
-		existingAddresses[endpoint.Address] = true
-	}
-
-	for _, endpoint := range newEndpoints {
-		if !existingAddresses[endpoint.Address] {
-			return true // Found a new address not present in the existing endpoints
-		}
-	}
-
-	return false // No changes in addresses found
 }
 
 // SetupWithManager sets up the controller with the Manager.

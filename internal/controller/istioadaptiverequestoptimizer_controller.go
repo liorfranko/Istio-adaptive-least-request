@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -56,27 +57,25 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer.Namespace", req.Namespace, "IstioAdaptiveRequestOptimizer.Name", req.Name)
 	// Fetch the IstioAdaptiveRequestOptimizer instance
-	optimizer := &optimizationv1alpha1.IstioAdaptiveRequestOptimizer{}
-	if err := r.Get(ctx, req.NamespacedName, optimizer); err != nil {
+	var opt optimizationv1alpha1.IstioAdaptiveRequestOptimizer
+	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found", "Namespace", req.Namespace, "Name", req.Name)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	logger.V(1).Info("IstioAdaptiveRequestOptimizer fetched", "IstioAdaptiveRequestOptimizer", optimizer.Spec)
-
-	if optimizer.GetDeletionTimestamp() != nil {
-		logger.Info("IstioAdaptiveRequestOptimizer marked for deletion", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-		_, err := r.handleFinalizer(ctx, optimizer)
+	logger.V(1).Info("IstioAdaptiveRequestOptimizer fetched", "IstioAdaptiveRequestOptimizer", opt.Spec)
+	if opt.GetDeletionTimestamp() != nil {
+		logger.Info("IstioAdaptiveRequestOptimizer marked for deletion", "IstioAdaptiveRequestOptimizer", opt.Name)
+		_, err := r.handleFinalizer(ctx, &opt)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
 	}
-
 	// If the object is not marked for deletion and does not have a finalizer
-	if !helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
+	if !slices.Contains(opt.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
 		// Attempt to add the finalizer
 		logger.Info("Finalizer not found, adding finalizer")
-		if err := r.addFinalizer(ctx, optimizer); err != nil {
+		if err := r.addFinalizer(ctx, &opt); err != nil {
 			logger.Error(err, "Failed to add finalizer")
 			// Return with error to requeue and try adding finalizer again
 			return ctrl.Result{}, err
@@ -84,12 +83,16 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 	}
 
 	// Fetch the Service based on the optimizer spec
-	service := &corev1.Service{}
-	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, service); err != nil {
-		logger.Error(err, "Failed to fetch Service", "ServiceName", optimizer.Spec.ServiceName)
+	var service corev1.Service
+	objectKey := client.ObjectKey{
+		Name:      opt.Spec.ServiceName,
+		Namespace: opt.Spec.ServiceNamespace,
+	}
+	if err := r.Get(ctx, objectKey, &service); err != nil {
+		logger.Error(err, "Failed to fetch Service", "ServiceName", opt.Spec.ServiceName)
 		return ctrl.Result{}, err
 	}
-	logger.V(1).Info("Service fetched", "Service", service)
+	logger.V(1).Info("Service fetched", "Service", &service)
 
 	// Fetch the EndpointSlices associated with the service
 	var endpointSliceList discoveryv1.EndpointSliceList
@@ -102,22 +105,22 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 	}
 
 	// Annotate the EndpointSlices
-	if err := r.annotateEndpointSlices(ctx, endpointSliceList.Items, optimizer); err != nil {
+	if err := r.annotateEndpointSlices(ctx, endpointSliceList.Items); err != nil {
 		logger.Error(err, "Failed to annotate EndpointSlices", "ServiceName", service.Name)
 		return ctrl.Result{}, err
 	}
 
 	// Create ServiceEntry using EndpointSlices
-	serviceEntry, err := r.createServiceEntry(ctx, service, endpointSliceList.Items, optimizer)
+	serviceEntry, err := r.createServiceEntry(ctx, &service, endpointSliceList.Items, &opt)
 	if err != nil {
 		logger.Error(err, "Failed to create ServiceEntry for port")
 		// TODO: Add a metric for failed ServiceEntry creation
 		return ctrl.Result{}, err
 	}
 
-	if err := r.updateOptimizerStatus(ctx, optimizer, serviceEntry); err != nil {
+	if err := r.updateOptimizerStatus(ctx, &opt, serviceEntry); err != nil {
 		// TODO: roman check why.
-		logger.Error(err, "Failed to update optimizer status with service entries")
+		logger.Error(err, "Failed to update opt status with service entries")
 		return ctrl.Result{}, err
 	}
 	// Requeue reconciliation every 60 seconds to track new EndpointSlices.
@@ -293,25 +296,16 @@ func normalizeProtocol(protocol string) string {
 	}
 }
 
-// annotateEndpointSlices adds the specified annotation to all EndpointSlices associated with the service.
-func (r *IstioAdaptiveRequestOptimizerReconciler) annotateEndpointSlices(ctx context.Context, endpointSlices []discoveryv1.EndpointSlice, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
-	// Skip if the optimizer is marked for deletion
-	if optimizer.GetDeletionTimestamp() != nil {
-		return nil
-	}
-
-	if len(optimizer.Spec.ServicePorts) > 0 {
-		for _, endpointSlice := range endpointSlices {
-			// Add the optimizer annotation to the EndpointSlice object
-			if endpointSlice.Annotations == nil {
-				endpointSlice.Annotations = make(map[string]string)
-			}
-			endpointSlice.Annotations[*r.EndpointsAnnotationKey] = "true"
-
-			// Update the EndpointSlice object with the new annotations
-			if err := r.Update(ctx, &endpointSlice); err != nil {
-				return err
-			}
+func (r *IstioAdaptiveRequestOptimizerReconciler) annotateEndpointSlices(ctx context.Context, endpointSlices []discoveryv1.EndpointSlice) error {
+	for _, endpointSlice := range endpointSlices {
+		// Add the opt annotation to the EndpointSlice object
+		if endpointSlice.Annotations == nil {
+			endpointSlice.Annotations = make(map[string]string)
+		}
+		endpointSlice.Annotations[*r.EndpointsAnnotationKey] = "true"
+		// Update the EndpointSlice object with the new annotations
+		if err := r.Update(ctx, &endpointSlice); err != nil {
+			return err
 		}
 	}
 	return nil
