@@ -56,7 +56,6 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer.Namespace", req.Namespace, "IstioAdaptiveRequestOptimizer.Name", req.Name)
-	// Fetch the IstioAdaptiveRequestOptimizer instance
 	var opt optimizationv1alpha1.IstioAdaptiveRequestOptimizer
 	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found", "Namespace", req.Namespace, "Name", req.Name)

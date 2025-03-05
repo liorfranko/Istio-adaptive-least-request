@@ -6,10 +6,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/helpers"
 	customMetrics "istio-adaptive-least-request/internal/metrics"
 
@@ -30,6 +30,7 @@ type EndpointSliceReconciler struct {
 	// Channel used to trigger reconciliation of ServiceEntry resources.
 	ServiceEntryReconcileTriggerChannel chan event.GenericEvent
 	NamespaceList                       []string
+	InitialWeight                       uint32
 }
 
 //+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
@@ -38,18 +39,26 @@ type EndpointSliceReconciler struct {
 //+kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch
 
 func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	ok, unlock, checkTouchedAndReset := tryLock(req.NamespacedName)
+	if !ok {
+		return ctrl.Result{}, nil
+	}
+	defer unlock()
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile EndpointSlice", "EndpointSlice.Namespace", req.Namespace, "EndpointSlice.Name", req.Name)
-
 	var endpointSlice discoveryv1.EndpointSlice
 	if err := r.Get(ctx, req.NamespacedName, &endpointSlice); err != nil {
 		logger.Error(err, "Failed to fetch EndpointSlice", "Namespace", req.Namespace, "Name", req.Name)
 		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetching_endpointslice", "name": req.Name, "namespace": req.Namespace}).Inc()
-		return ctrl.Result{}, err
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, err
 	}
 	logger.V(1).Info("EndpointSlice fetched", "Endpoints", endpointSlice.Endpoints)
 	if isObjectMarkedForDeletion(&endpointSlice) {
-		return ctrl.Result{}, nil
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, nil
 	}
 	// Extract the service name from the EndpointSlice labels
 	serviceName := endpointSlice.Labels[discoveryv1.LabelServiceName]
@@ -62,65 +71,38 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if err := r.Client.Get(ctx, key, &serviceEntry); err != nil {
 		logger.Error(err, "Failed to list ServiceEntry", "Namespace", req.Namespace, "ServiceName", serviceName)
-		return ctrl.Result{}, err
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, err
 	}
-	logger.V(1).Info("ServiceEntry fetched", "ServiceEntry", &serviceEntry)
-	var endpointSlices discoveryv1.EndpointSliceList
-	endpointSlicesLabels := client.MatchingLabels{discoveryv1.LabelServiceName: serviceName}
-	if err := r.List(ctx, &endpointSlices, client.InNamespace(req.Namespace), endpointSlicesLabels); err != nil {
-		logger.Error(err, "Failed to list EndpointSlices", "Namespace", req.Namespace, "ServiceName", serviceName)
-		return ctrl.Result{}, err
+	var opt optimizationv1alpha1.IstioAdaptiveRequestOptimizer
+	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
+		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, client.IgnoreNotFound(err)
 	}
-	// Collect addresses from the EndpointSlice
-	endpointAddressesSet := make(map[string]struct{})
-	for i := range endpointSlices.Items {
-		endpointSlice := &endpointSlices.Items[i]
-		for j := range endpointSlice.Endpoints {
-			endpoint := &endpointSlice.Endpoints[j]
-			if len(endpoint.Addresses) == 0 {
-				continue
-			}
-			endpointAddressesSet[endpoint.Addresses[0]] = struct{}{}
-		}
+	oldWorkloads, err := handleEndpointUpdate(
+		ctx,
+		logger,
+		r.Client,
+		*r.ServiceEntryServiceNameLabelKey,
+		uint32(r.InitialWeight),
+		req,
+		&serviceEntry,
+		opt.Spec.LocalityEnabled,
+	)
+	if err != nil {
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, err
 	}
-
-	// Collect addresses from the ServiceEntry
-	serviceEntryAddressesSet := make(map[string]struct{})
-	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
-		serviceEntryAddressesSet[workloadEntry.Address] = struct{}{}
-	}
-	// Compare the addresses
-	if !addressesEqual(endpointAddressesSet, serviceEntryAddressesSet) {
-		// Addresses are different, trigger reconciliation
-		logger.V(1).Info("EndpointSlice and ServiceEntry addresses differ, triggering reconciliation", "ServiceEntry.Name", serviceEntry.Name)
-		r.ServiceEntryReconcileTriggerChannel <- event.GenericEvent{
-			Object: &istioClientV1.ServiceEntry{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      serviceEntry.Name,
-					Namespace: serviceEntry.Namespace,
-				},
-			},
-		}
-	}
-
-	return ctrl.Result{}, nil
+	cleanupPodMetrics(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
+	return ctrl.Result{
+		Requeue: checkTouchedAndReset(),
+	}, nil
 }
 
-// addressesEqual compares two sets of addresses represented as maps
-func addressesEqual(a, b map[string]struct{}) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k := range a {
-		if _, ok := b[k]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// checkNamespaceAndAnnotation checks if the namespace of the object is allowed
-// and if the specified annotation exists and has the correct value.
 func (r *EndpointSliceReconciler) checkNamespaceAndAnnotation(obj client.Object) bool {
 	if r.EndpointsAnnotationKey == nil {
 		// Optionally log a warning

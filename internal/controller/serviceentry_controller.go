@@ -18,7 +18,7 @@ package controller
 
 import (
 	"context"
-	"sort"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,13 +97,13 @@ func getMux(namespace, name string) *tMarkMux {
 	return markMux
 }
 
-func tryLock(name types.NamespacedName) (bool, func()) {
+func tryLock(name types.NamespacedName) (bool, func(), func() bool) {
 	markMux := getMux(name.Namespace, name.Name)
 	if !markMux.mux.TryLock() {
 		atomic.AddInt64(&markMux.touched, 1)
-		return false, nil
+		return false, nil, nil
 	}
-	return true, markMux.mux.Unlock
+	return true, markMux.mux.Unlock, markMux.checkTouchedAndReset
 }
 
 //+kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch
@@ -113,18 +113,11 @@ func tryLock(name types.NamespacedName) (bool, func()) {
 //+kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch
 
 func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	ok, unlock := tryLock(req.NamespacedName)
+	ok, unlock, checkTouchedAndReset := tryLock(req.NamespacedName)
 	if !ok {
 		return ctrl.Result{}, nil
 	}
 	defer unlock()
-
-	markMux := getMux(req.Namespace, req.Name)
-	if !markMux.mux.TryLock() {
-		atomic.AddInt64(&markMux.touched, 1)
-		return ctrl.Result{}, nil
-	}
-	defer markMux.mux.Unlock()
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile ServiceEntry", "ServiceEntry.Namespace", req.Namespace, "ServiceEntry.Name", req.Name)
 	// Step 1: Fetch the IstioAdaptiveRequestOptimizer object based on the request.
@@ -132,71 +125,77 @@ func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
 		return ctrl.Result{
-			Requeue: markMux.checkTouchedAndReset(),
+			Requeue: checkTouchedAndReset(),
 		}, client.IgnoreNotFound(err)
 	}
 
 	// Step 2: Check for Endpoint updates.
-	oldWorkloads, err := r.handleEndpointUpdate(ctx, req, &opt)
-	if client.IgnoreNotFound(err) != nil {
-		logger.Error(err, "Failed to handle Endpoint update.")
-		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "handle_endpoint_update", "name": req.Name, "namespace": req.Namespace}).Inc()
-		return ctrl.Result{
-			Requeue: markMux.checkTouchedAndReset(),
-		}, err
-	}
-	cleanupPodMetrics(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
-	return ctrl.Result{
-		Requeue: markMux.checkTouchedAndReset(),
-	}, nil
-}
-
-// handleEndpointUpdate checks for changes in the EndpointSlices and updates the ServiceEntry if necessary.
-func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req ctrl.Request, opt *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) ([]*istioNetworkingV1.WorkloadEntry, error) {
-	logger := log.FromContext(ctx).WithName(r.LoggerName)
-
-	// Fetch the specific ServiceEntry.
 	var serviceEntry istioClientV1.ServiceEntry
 	err := r.Get(ctx, req.NamespacedName, &serviceEntry)
 	if client.IgnoreNotFound(err) != nil {
 		logger.Error(err, "Failed to fetch ServiceEntry.")
-		return nil, err
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, err
 	}
 
+	oldWorkloads, err := handleEndpointUpdate(
+		ctx,
+		logger,
+		r.Client,
+		*r.ServiceEntryServiceNameLabelKey,
+		uint32(r.InitialWeight),
+		req,
+		&serviceEntry,
+		opt.Spec.LocalityEnabled,
+	)
+	if client.IgnoreNotFound(err) != nil {
+		logger.Error(err, "Failed to handle Endpoint update.")
+		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "handle_endpoint_update", "name": req.Name, "namespace": req.Namespace}).Inc()
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, err
+	}
+	cleanupPodMetrics(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
+	return ctrl.Result{
+		Requeue: checkTouchedAndReset(),
+	}, nil
+}
+
+func handleEndpointUpdate(
+	ctx context.Context,
+	logger logr.Logger,
+	c client.Client,
+	serviceEntryServiceNameLabelKey string,
+	initialWeight uint32,
+	req ctrl.Request,
+	serviceEntry *istioClientV1.ServiceEntry,
+	localityEnabled bool,
+) ([]*istioNetworkingV1.WorkloadEntry, error) {
 	// Extract the original service name from the ServiceEntry's labels.
-	originalServiceName := serviceEntry.Labels[*r.ServiceEntryServiceNameLabelKey]
+	originalServiceName := serviceEntry.Labels[serviceEntryServiceNameLabelKey]
 	if originalServiceName == "" {
-		logger.Error(nil, "ServiceEntry does not contain the expected label.", "Label", *r.ServiceEntryServiceNameLabelKey)
-		return nil, err // or an error, as appropriate
+		logger.Error(nil, "ServiceEntry does not contain the expected label.", "Label", serviceEntryServiceNameLabelKey)
+		return nil, fmt.Errorf("ServiceEntry does not contain the expected label %s", serviceEntryServiceNameLabelKey)
 	}
-
-	// List all EndpointSlices for the given service in the same namespace using label selectors.
 	var endpointSlices discoveryv1.EndpointSliceList
 	labelSelector := client.MatchingLabels{
-		"kubernetes.io/service-name": originalServiceName,
+		discoveryv1.LabelServiceName: originalServiceName,
 	}
-	if err := r.List(ctx, &endpointSlices, client.InNamespace(req.Namespace), labelSelector); err != nil {
+	if err := c.List(ctx, &endpointSlices, client.InNamespace(req.Namespace), labelSelector); err != nil {
 		logger.Error(err, "Failed to list EndpointSlices for service", "Namespace", req.Namespace, "Name", originalServiceName)
 		return nil, err
 	}
-
 	if len(endpointSlices.Items) == 0 {
 		logger.Info("No EndpointSlices found for service", "Namespace", req.Namespace, "Name", originalServiceName)
-		return nil, err // No endpoints to process
+		return nil, nil // No endpoints to process
 	}
-
 	addressToWorkloadEntry := make(map[string]*istioNetworkingV1.WorkloadEntry)
 	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
 		addressToWorkloadEntry[workloadEntry.Address] = workloadEntry
 	}
-
-	defaultWeight := uint32(r.InitialWeight)
-	logger.Info("Calculated default weight for new endpoints", "defaultWeight", defaultWeight)
-
-	// Aggregate endpoints from all EndpointSlices, assigning default weight to new ones.
 	existAddresses := make(map[string]struct{})
 	newWorkloadEntries := make([]*istioNetworkingV1.WorkloadEntry, 0)
-	localityEnabled := opt.Spec.LocalityEnabled
 	for _, endpointSlice := range endpointSlices.Items {
 		for _, endpoint := range endpointSlice.Endpoints {
 			if readyPtr := endpoint.Conditions.Ready; readyPtr == nil || !*readyPtr {
@@ -221,7 +220,7 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 			if !ok {
 				workloadEntry = &istioNetworkingV1.WorkloadEntry{
 					Address: address,
-					Weight:  defaultWeight,
+					Weight:  initialWeight,
 				}
 			}
 			var locality string
@@ -236,7 +235,7 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 	}
 
 	var coreService corev1.Service
-	if err := r.Get(ctx, req.NamespacedName, &coreService); err != nil {
+	if err := c.Get(ctx, req.NamespacedName, &coreService); err != nil {
 		logger.Error(err, "Failed to fetch Service.")
 		return nil, err
 	}
@@ -256,11 +255,11 @@ func (r *ServiceEntryReconciler) handleEndpointUpdate(ctx context.Context, req c
 	}
 	// Update the ServiceEntry with the newly merged endpoints.
 	serviceEntry.Spec.Endpoints = newWorkloadEntries
-	if err := r.Update(ctx, &serviceEntry); err != nil {
+	if err := c.Update(ctx, serviceEntry); err != nil {
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		return nil, err // Return the error to retry
 	}
-	updateMetrics(&serviceEntry)
+	updateMetrics(serviceEntry)
 	logger.Info("ServiceEntry updated handleEndpointUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
 	return workloadEntriesDiff, nil
 }
@@ -308,33 +307,6 @@ func getLocalityForMetric(locality string) string {
 		return parts[1]
 	}
 	return locality
-}
-
-func (r *ServiceEntryReconciler) CreateDefaultWeightForNewEndpoints(weights []uint32) uint32 {
-	if len(weights) == 0 {
-		middle := (r.MaximumWeight + r.MinimumWeight) / 2
-		return uint32(middle) // Return the middle value if no existing weights
-	}
-
-	// Sort the slice
-	sort.Slice(weights, func(i, j int) bool {
-		return weights[i] < weights[j]
-	})
-
-	// Calculate number of elements in the lowest newEndpointsPercentileWeight
-	n := len(weights) * r.NewEndpointsPercentileWeight / 100
-	if n == 0 {
-		n = 1 // Ensure at least one element is considered if len(weights) < 5
-	}
-
-	// Sum up the lowest newEndpointsPercentileWeight
-	var sum uint32
-	for i := 0; i < n; i++ {
-		sum += weights[i]
-	}
-
-	// Calculate the default of the lowest newEndpointsPercentileWeight
-	return sum / uint32(n)
 }
 
 // SetupWithManager sets up the controller with the Manager.

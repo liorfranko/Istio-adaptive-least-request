@@ -108,6 +108,7 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		logger.Info("IstioLatencyOptimizer not found", "Namespace", req.Namespace, "Name", req.Name)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	logger.V(1).Info("IstioAdaptiveRequestOptimizer fetched", "IstioAdaptiveRequestOptimizer", opt.Spec)
 	if opt.GetDeletionTimestamp() != nil {
 		// We've got an update event that indicate the instance is being deleted, the event it update by this controller doesn't need to do anything with it as the IstioLatencyOptimizer handle the deltion
 		logger.Info("IstioLatencyOptimizer is being deleted", "Namespace", opt.Namespace, "Name", opt.Name)

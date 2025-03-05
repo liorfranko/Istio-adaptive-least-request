@@ -216,6 +216,7 @@ func main() {
 		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
 		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
 		NamespaceList:                       namespaceList,
+		InitialWeight:                       uint32(initialWeight),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Endpoint")
 		os.Exit(1)
@@ -237,21 +238,6 @@ func main() {
 		ScaledownFactor:               scaledownFactor,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WeightOptimizer")
-		os.Exit(1)
-	}
-	if err = (&controller.ServiceEntryReconciler{
-		Client:                              mgr.GetClient(),
-		Scheme:                              mgr.GetScheme(),
-		LoggerName:                          "ServiceEntryController",
-		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
-		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
-		NamespaceList:                       namespaceList,
-		NewEndpointsPercentileWeight:        newEndpointsPercentileWeight,
-		MaximumWeight:                       maximumWeight,
-		MinimumWeight:                       minimumWeight,
-		InitialWeight:                       initialWeight,
-	}).SetupWithManager(mgr, setupLog); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "ServiceEntry")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
