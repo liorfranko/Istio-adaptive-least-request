@@ -2,21 +2,19 @@ package controller
 
 import (
 	"context"
+	"slices"
+	"strings"
 
-	"github.com/prometheus/client_golang/prometheus"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
-
-	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
-	"istio-adaptive-least-request/internal/helpers"
-	customMetrics "istio-adaptive-least-request/internal/metrics"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	api "istio-adaptive-least-request/api/v1alpha1"
 )
 
 // EndpointSliceReconciler reconciles an EndpointSlice object
@@ -25,12 +23,9 @@ type EndpointSliceReconciler struct {
 	Scheme                          *runtime.Scheme
 	LoggerName                      string
 	DryRun                          bool
-	EndpointsAnnotationKey          *string
 	ServiceEntryServiceNameLabelKey *string
-	// Channel used to trigger reconciliation of ServiceEntry resources.
-	ServiceEntryReconcileTriggerChannel chan event.GenericEvent
-	NamespaceList                       []string
-	InitialWeight                       uint32
+	NamespaceList                   []string
+	InitialWeight                   uint32
 }
 
 //+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
@@ -45,25 +40,14 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	defer unlock()
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(1).Info("Reconcile EndpointSlice", "EndpointSlice.Namespace", req.Namespace, "EndpointSlice.Name", req.Name)
-	var endpointSlice discoveryv1.EndpointSlice
-	if err := r.Get(ctx, req.NamespacedName, &endpointSlice); err != nil {
-		logger.Error(err, "Failed to fetch EndpointSlice", "Namespace", req.Namespace, "Name", req.Name)
-		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fetching_endpointslice", "name": req.Name, "namespace": req.Namespace}).Inc()
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, err
-	}
-	logger.V(1).Info("EndpointSlice fetched", "Endpoints", endpointSlice.Endpoints)
-	if isObjectMarkedForDeletion(&endpointSlice) {
+	logger.V(1).Info("Reconcile EndpointSlice", "Namespace", req.Namespace, "Name", req.Name)
+	serviceName := endpointSliceNameToServiceName(req.Name)
+	if serviceName == "" {
+		logger.Info("Failed to extract service name from EndpointSlice name")
 		return ctrl.Result{
 			Requeue: checkTouchedAndReset(),
 		}, nil
 	}
-	// Extract the service name from the EndpointSlice labels
-	serviceName := endpointSlice.Labels[discoveryv1.LabelServiceName]
-
-	// Fetch the corresponding ServiceEntry resources
 	var serviceEntry istioClientV1.ServiceEntry
 	key := client.ObjectKey{
 		Namespace: req.Namespace,
@@ -75,8 +59,20 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			Requeue: checkTouchedAndReset(),
 		}, err
 	}
-	var opt optimizationv1alpha1.IstioAdaptiveRequestOptimizer
-	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
+	ownerReferences := serviceEntry.OwnerReferences
+	if len(ownerReferences) == 0 {
+		logger.Info("ServiceEntry does not have owner reference. No weight adjustments made.")
+		return ctrl.Result{
+			Requeue: checkTouchedAndReset(),
+		}, nil
+	}
+	optName := ownerReferences[0].Name
+	objectKey := client.ObjectKey{
+		Namespace: req.Namespace,
+		Name:      optName,
+	}
+	var opt api.IstioAdaptiveRequestOptimizer
+	if err := r.Get(ctx, objectKey, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
 		return ctrl.Result{
 			Requeue: checkTouchedAndReset(),
@@ -87,7 +83,7 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger,
 		r.Client,
 		*r.ServiceEntryServiceNameLabelKey,
-		uint32(r.InitialWeight),
+		r.InitialWeight,
 		req,
 		&serviceEntry,
 		opt.Spec.LocalityEnabled,
@@ -103,39 +99,32 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}, nil
 }
 
-func (r *EndpointSliceReconciler) checkNamespaceAndAnnotation(obj client.Object) bool {
-	if r.EndpointsAnnotationKey == nil {
-		// Optionally log a warning
-		//log.Log.V(1).Info("EndpointsAnnotationKey is not set, skipping annotation check")
-		return false
+// endpointSliceNameToServiceName extracts the Service name from the EndpointSlice name.
+func endpointSliceNameToServiceName(endpointSliceName string) string {
+	lastHyphenIndex := strings.LastIndex(endpointSliceName, "-")
+	if lastHyphenIndex == -1 {
+		return ""
 	}
-	annotationKey := *r.EndpointsAnnotationKey
-	annotationValue := "true"
+	return endpointSliceName[:lastHyphenIndex]
+}
 
-	// First, check if the namespace is in the allowed list.
-	if !helpers.NamespaceInFilteredList(obj.GetNamespace(), r.NamespaceList) {
-		return false
-	}
-	// Then, check if the annotation exists and has the correct value.
-	annotations := obj.GetAnnotations()
-	val, exists := annotations[annotationKey]
-	return exists && val == annotationValue
+func (r *EndpointSliceReconciler) checkNamespace(obj client.Object) bool {
+	return slices.Contains(r.NamespaceList, obj.GetNamespace())
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *EndpointSliceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	namespaceAndAnnotationPredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			return r.checkNamespaceAndAnnotation(e.Object)
+			return r.checkNamespace(e.Object)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
-			return false
+			return r.checkNamespace(e.Object)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return r.checkNamespaceAndAnnotation(e.ObjectNew)
+			return r.checkNamespace(e.ObjectNew)
 		},
 	}
-
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&discoveryv1.EndpointSlice{}).
 		WithEventFilter(namespaceAndAnnotationPredicate).

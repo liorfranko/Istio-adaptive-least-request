@@ -23,12 +23,11 @@ import (
 	"strings"
 	"time"
 
-	"sigs.k8s.io/controller-runtime/pkg/event"
-
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -37,8 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
-
-	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/controller"
@@ -66,7 +63,6 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
-	var endpointsAnnotationKey, endpointPodScrapeAnnotationKey string
 	var serviceEntryLabelKey, serviceEntryServiceNameLabelKey string
 	var namespaces string
 	var vmdbUrl string
@@ -88,8 +84,6 @@ func main() {
 		"If set the metrics endpoint is served securely")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.StringVar(&endpointsAnnotationKey, "endpoints-annotation", "istio.adaptive.request.optimizer/optimize", "The annotation to use for setting that the endpoints object is optimized")
-	flag.StringVar(&endpointPodScrapeAnnotationKey, "endpoint-pod-scrape-annotation", "istio.adaptive.request.optimizer/scrape", "The annotation to use for setting that the endpoints object is to be scraped")
 	flag.StringVar(&serviceEntryLabelKey, "serviceentry-label", "istio.adaptive.request.optimizer/optimize", "The label to use for setting that the ServiceEntry object is optimized")
 	flag.StringVar(&serviceEntryServiceNameLabelKey, "serviceentry-service-name-label", "istio.adaptive.request.optimizer/service-name", "The label to use for setting the service name in the ServiceEntry object")
 	flag.StringVar(&namespaces, "namespaces", "", "Comma-separated list of namespaces to watch")
@@ -156,7 +150,7 @@ func main() {
 		c.NextProtos = []string{"http/1.1"}
 	}
 
-	tlsOpts := []func(*tls.Config){}
+	var tlsOpts []func(*tls.Config)
 	if !enableHTTP2 {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
@@ -197,47 +191,22 @@ func main() {
 		Client:                          mgr.GetClient(),
 		Scheme:                          mgr.GetScheme(),
 		LoggerName:                      "IstioAdaptiveRequestOptimizer",
-		EndpointsAnnotationKey:          &endpointsAnnotationKey,
-		EndpointsPodScrapeAnnotationKey: &endpointPodScrapeAnnotationKey,
-		ServiceEntryLabelKey:            &serviceEntryLabelKey,
-		ServiceEntryServiceNameLabelKey: &serviceEntryServiceNameLabelKey,
+		ServiceEntryLabelKey:            serviceEntryLabelKey,
+		ServiceEntryServiceNameLabelKey: serviceEntryServiceNameLabelKey,
 		NamespaceList:                   namespaceList,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IstioAdaptiveRequestOptimizer")
 		os.Exit(1)
 	}
-	//Create the channel for triggering ServiceEntry reconciliation
-	serviceEntryReconcileTriggerChannel := make(chan event.GenericEvent, 100)
 	if err = (&controller.EndpointSliceReconciler{
-		Client:                              mgr.GetClient(),
-		Scheme:                              mgr.GetScheme(),
-		LoggerName:                          "EndpointSliceController",
-		EndpointsAnnotationKey:              &endpointsAnnotationKey,
-		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
-		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
-		NamespaceList:                       namespaceList,
-		InitialWeight:                       uint32(initialWeight),
+		Client:                          mgr.GetClient(),
+		Scheme:                          mgr.GetScheme(),
+		LoggerName:                      "EndpointSliceController",
+		ServiceEntryServiceNameLabelKey: &serviceEntryServiceNameLabelKey,
+		NamespaceList:                   namespaceList,
+		InitialWeight:                   uint32(initialWeight),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Endpoint")
-		os.Exit(1)
-	}
-	if err = (&controller.WeightOptimizerReconciler{
-		Client:                        mgr.GetClient(),
-		Scheme:                        mgr.GetScheme(),
-		LoggerName:                    "WeightOptimizerController",
-		VmdbUrl:                       &vmdbUrl,
-		NamespaceList:                 namespaceList,
-		RequeueAfter:                  time.Duration(optimizeCycleTime),
-		MaximumWeight:                 maximumWeight,
-		MinimumWeight:                 minimumWeight,
-		QueryInterval:                 queryInterval,
-		StepInterval:                  stepInterval,
-		MinOptimizeCpuDistancePercent: minOptimizeCpuDistancePercent,
-		CpuDistanceMultiplierPercent:  cpuDistanceMultiplierPercent,
-		ScaleupFactor:                 scaleupFactor,
-		ScaledownFactor:               scaledownFactor,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "WeightOptimizer")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

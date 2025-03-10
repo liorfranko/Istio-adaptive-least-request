@@ -24,44 +24,17 @@ import (
 	"sync/atomic"
 
 	"github.com/go-logr/logr"
-	"github.com/prometheus/client_golang/prometheus"
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/source"
-
-	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
-	"istio-adaptive-least-request/internal/helpers"
-	customMetrics "istio-adaptive-least-request/internal/metrics"
-
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"istio-adaptive-least-request/internal/helpers"
+	customMetrics "istio-adaptive-least-request/internal/metrics"
 )
-
-// ServiceEntryReconciler reconciles a ServiceEntry object
-type ServiceEntryReconciler struct {
-	client.Client
-	Scheme     *runtime.Scheme
-	LoggerName string
-	// Channel used to trigger reconciliation of ServiceEntry resources.
-	ServiceEntryReconcileTriggerChannel <-chan event.GenericEvent
-	ServiceEntryServiceNameLabelKey     *string
-	NamespaceList                       []string
-	NewEndpointsPercentileWeight        int
-	MinimumWeight                       int
-	MaximumWeight                       int
-	InitialWeight                       int
-
-	//TODO: add dry run mode logic
-	//DryRun bool
-}
 
 type tKeyToMuxKey struct {
 	Namespace string
@@ -106,62 +79,6 @@ func tryLock(name types.NamespacedName) (bool, func(), func() bool) {
 	return true, markMux.mux.Unlock, markMux.checkTouchedAndReset
 }
 
-//+kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch
-// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=serviceentries,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=serviceentries/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=serviceentries/finalizers,verbs=update
-//+kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch
-
-func (r *ServiceEntryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	ok, unlock, checkTouchedAndReset := tryLock(req.NamespacedName)
-	if !ok {
-		return ctrl.Result{}, nil
-	}
-	defer unlock()
-	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(1).Info("Reconcile ServiceEntry", "ServiceEntry.Namespace", req.Namespace, "ServiceEntry.Name", req.Name)
-	// Step 1: Fetch the IstioAdaptiveRequestOptimizer object based on the request.
-	var opt optimizationv1alpha1.IstioAdaptiveRequestOptimizer
-	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
-		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, client.IgnoreNotFound(err)
-	}
-
-	// Step 2: Check for Endpoint updates.
-	var serviceEntry istioClientV1.ServiceEntry
-	err := r.Get(ctx, req.NamespacedName, &serviceEntry)
-	if client.IgnoreNotFound(err) != nil {
-		logger.Error(err, "Failed to fetch ServiceEntry.")
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, err
-	}
-
-	oldWorkloads, err := handleEndpointUpdate(
-		ctx,
-		logger,
-		r.Client,
-		*r.ServiceEntryServiceNameLabelKey,
-		uint32(r.InitialWeight),
-		req,
-		&serviceEntry,
-		opt.Spec.LocalityEnabled,
-	)
-	if client.IgnoreNotFound(err) != nil {
-		logger.Error(err, "Failed to handle Endpoint update.")
-		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "handle_endpoint_update", "name": req.Name, "namespace": req.Namespace}).Inc()
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, err
-	}
-	cleanupPodMetrics(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
-	return ctrl.Result{
-		Requeue: checkTouchedAndReset(),
-	}, nil
-}
-
 func handleEndpointUpdate(
 	ctx context.Context,
 	logger logr.Logger,
@@ -175,7 +92,9 @@ func handleEndpointUpdate(
 	// Extract the original service name from the ServiceEntry's labels.
 	originalServiceName := serviceEntry.Labels[serviceEntryServiceNameLabelKey]
 	if originalServiceName == "" {
-		logger.Error(nil, "ServiceEntry does not contain the expected label.", "Label", serviceEntryServiceNameLabelKey)
+		logger.Error(nil, "ServiceEntry does not contain the expected label.",
+			"Label", serviceEntryServiceNameLabelKey,
+		)
 		return nil, fmt.Errorf("ServiceEntry does not contain the expected label %s", serviceEntryServiceNameLabelKey)
 	}
 	var endpointSlices discoveryv1.EndpointSliceList
@@ -183,7 +102,10 @@ func handleEndpointUpdate(
 		discoveryv1.LabelServiceName: originalServiceName,
 	}
 	if err := c.List(ctx, &endpointSlices, client.InNamespace(req.Namespace), labelSelector); err != nil {
-		logger.Error(err, "Failed to list EndpointSlices for service", "Namespace", req.Namespace, "Name", originalServiceName)
+		logger.Error(err, "Failed to list EndpointSlices for service",
+			"Namespace", req.Namespace,
+			"Name", originalServiceName,
+		)
 		return nil, err
 	}
 	if len(endpointSlices.Items) == 0 {
@@ -196,7 +118,12 @@ func handleEndpointUpdate(
 	}
 	existAddresses := make(map[string]struct{})
 	newWorkloadEntries := make([]*istioNetworkingV1.WorkloadEntry, 0)
-	for _, endpointSlice := range endpointSlices.Items {
+	for i := range endpointSlices.Items {
+		endpointSlice := &endpointSlices.Items[i]
+		if !endpointSlice.DeletionTimestamp.IsZero() {
+			// Skip deleted EndpointSlices
+			continue
+		}
 		for _, endpoint := range endpointSlice.Endpoints {
 			if readyPtr := endpoint.Conditions.Ready; readyPtr == nil || !*readyPtr {
 				logger.Info("Endpoint is not ready", "Endpoint", endpoint)
@@ -264,23 +191,6 @@ func handleEndpointUpdate(
 	return workloadEntriesDiff, nil
 }
 
-func checkPortsChanged(istioPorts []*istioNetworkingV1.ServicePort, optPorts []optimizationv1alpha1.ServicePort) bool {
-	if len(istioPorts) != len(optPorts) {
-		return true
-	}
-	istioPortsMap := make(map[string]uint32)
-	for _, port := range istioPorts {
-		istioPortsMap[port.Name] = port.TargetPort
-	}
-	for i := range optPorts {
-		port := &optPorts[i]
-		if istioPortsMap[port.Protocol] != port.TargetPort {
-			return true
-		}
-	}
-	return false
-}
-
 func updateMetrics(serviceEntry *istioClientV1.ServiceEntry) {
 	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
 		podAddress := workloadEntry.Address
@@ -307,35 +217,4 @@ func getLocalityForMetric(locality string) string {
 		return parts[1]
 	}
 	return locality
-}
-
-// SetupWithManager sets up the controller with the Manager.
-func (r *ServiceEntryReconciler) SetupWithManager(mgr ctrl.Manager, logger logr.Logger) error {
-	namespacePredicate := predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			//logger.Info("Create event received", "object", e.Object)
-			namespace := e.Object.GetNamespace()
-			//logger.Info("Create event for namespace", "namespace", namespace)
-			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
-			//logger.Info("Namespace in list", "inList", inList)
-			return inList
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			return false
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			//logger.Info("Update event received", "old object", e.ObjectOld, "new object", e.ObjectNew)
-			namespace := e.ObjectNew.GetNamespace()
-			//logger.Info("Update event for namespace", "namespace", namespace)
-			inList := helpers.NamespaceInFilteredList(namespace, r.NamespaceList)
-			//logger.Info("Namespace in list", "inList", inList)
-			return inList
-		},
-	}
-
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&optimizationv1alpha1.WeightOptimizer{}).
-		WithEventFilter(namespacePredicate).
-		WatchesRawSource(source.Channel(r.ServiceEntryReconcileTriggerChannel, &handler.EnqueueRequestForObject{})).
-		Complete(r)
 }
