@@ -28,7 +28,6 @@ import (
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -70,8 +69,8 @@ func getMux(namespace, name string) *tMarkMux {
 	return markMux
 }
 
-func tryLock(name types.NamespacedName) (bool, func(), func() bool) {
-	markMux := getMux(name.Namespace, name.Name)
+func tryLock(namespace, name string) (bool, func(), func() bool) {
+	markMux := getMux(namespace, name)
 	if !markMux.mux.TryLock() {
 		atomic.AddInt64(&markMux.touched, 1)
 		return false, nil, nil
@@ -88,14 +87,19 @@ func handleEndpointUpdate(
 	req ctrl.Request,
 	serviceEntry *istioClientV1.ServiceEntry,
 	localityEnabled bool,
-) ([]*istioNetworkingV1.WorkloadEntry, error) {
+) ([]*istioNetworkingV1.WorkloadEntry, bool, error) {
+	ok, unlock, checkTouchedAndReset := tryLock(req.Namespace, req.Name)
+	if !ok {
+		return nil, false, nil
+	}
+	defer unlock()
 	// Extract the original service name from the ServiceEntry's labels.
 	originalServiceName := serviceEntry.Labels[serviceEntryServiceNameLabelKey]
 	if originalServiceName == "" {
 		logger.Error(nil, "ServiceEntry does not contain the expected label.",
 			"Label", serviceEntryServiceNameLabelKey,
 		)
-		return nil, fmt.Errorf("ServiceEntry does not contain the expected label %s", serviceEntryServiceNameLabelKey)
+		return nil, checkTouchedAndReset(), fmt.Errorf("ServiceEntry does not contain the expected label %s", serviceEntryServiceNameLabelKey)
 	}
 	var endpointSlices discoveryv1.EndpointSliceList
 	labelSelector := client.MatchingLabels{
@@ -106,11 +110,11 @@ func handleEndpointUpdate(
 			"Namespace", req.Namespace,
 			"Name", originalServiceName,
 		)
-		return nil, err
+		return nil, checkTouchedAndReset(), err
 	}
 	if len(endpointSlices.Items) == 0 {
 		logger.Info("No EndpointSlices found for service", "Namespace", req.Namespace, "Name", originalServiceName)
-		return nil, nil // No endpoints to process
+		return nil, checkTouchedAndReset(), nil // No endpoints to process
 	}
 	addressToWorkloadEntry := make(map[string]*istioNetworkingV1.WorkloadEntry)
 	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
@@ -164,7 +168,7 @@ func handleEndpointUpdate(
 	var coreService corev1.Service
 	if err := c.Get(ctx, req.NamespacedName, &coreService); err != nil {
 		logger.Error(err, "Failed to fetch Service.")
-		return nil, err
+		return nil, checkTouchedAndReset(), err
 	}
 	serviceEntry.Spec.Ports = appendCoreServicePortsToIstioServicePorts(serviceEntry.Spec.Ports[:0], coreService.Spec.Ports)
 
@@ -178,17 +182,17 @@ func handleEndpointUpdate(
 
 	if len(workloadEntriesDiff) == 0 {
 		logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
-		return nil, nil // No changes, no need to update.
+		return nil, checkTouchedAndReset(), nil // No changes, no need to update.
 	}
 	// Update the ServiceEntry with the newly merged endpoints.
 	serviceEntry.Spec.Endpoints = newWorkloadEntries
 	if err := c.Update(ctx, serviceEntry); err != nil {
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
-		return nil, err // Return the error to retry
+		return nil, checkTouchedAndReset(), err // Return the error to retry
 	}
 	updateMetrics(serviceEntry)
 	logger.Info("ServiceEntry updated handleEndpointUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
-	return workloadEntriesDiff, nil
+	return workloadEntriesDiff, checkTouchedAndReset(), nil
 }
 
 func updateMetrics(serviceEntry *istioClientV1.ServiceEntry) {

@@ -22,7 +22,6 @@ type EndpointSliceReconciler struct {
 	client.Client
 	Scheme                          *runtime.Scheme
 	LoggerName                      string
-	DryRun                          bool
 	ServiceEntryServiceNameLabelKey string
 	NamespaceList                   []string
 	InitialWeight                   uint32
@@ -34,19 +33,12 @@ type EndpointSliceReconciler struct {
 //+kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch
 
 func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	ok, unlock, checkTouchedAndReset := tryLock(req.NamespacedName)
-	if !ok {
-		return ctrl.Result{}, nil
-	}
-	defer unlock()
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
 	logger.V(1).Info("Reconcile EndpointSlice", "Namespace", req.Namespace, "Name", req.Name)
 	serviceName := endpointSliceNameToServiceName(req.Name)
 	if serviceName == "" {
 		logger.Info("Failed to extract service name from EndpointSlice name")
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, nil
+		return ctrl.Result{}, nil
 	}
 	var serviceEntry istioClientV1.ServiceEntry
 	key := client.ObjectKey{
@@ -55,16 +47,12 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if err := r.Client.Get(ctx, key, &serviceEntry); err != nil {
 		logger.Error(err, "Failed to list ServiceEntry", "Namespace", req.Namespace, "ServiceName", serviceName)
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, err
+		return ctrl.Result{}, err
 	}
 	ownerReferences := serviceEntry.OwnerReferences
 	if len(ownerReferences) == 0 {
 		logger.Info("ServiceEntry does not have owner reference. No weight adjustments made.")
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, nil
+		return ctrl.Result{}, nil
 	}
 	optName := ownerReferences[0].Name
 	objectKey := client.ObjectKey{
@@ -74,11 +62,9 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var opt api.IstioAdaptiveRequestOptimizer
 	if err := r.Get(ctx, objectKey, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
-		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
-		}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	oldWorkloads, err := handleEndpointUpdate(
+	oldWorkloads, requeue, err := handleEndpointUpdate(
 		ctx,
 		logger,
 		r.Client,
@@ -90,12 +76,12 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	)
 	if err != nil {
 		return ctrl.Result{
-			Requeue: checkTouchedAndReset(),
+			Requeue: requeue,
 		}, err
 	}
 	cleanupPodMetrics(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
 	return ctrl.Result{
-		Requeue: checkTouchedAndReset(),
+		Requeue: requeue,
 	}, nil
 }
 
