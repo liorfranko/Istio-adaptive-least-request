@@ -194,6 +194,13 @@ func main() {
 		ServiceEntryLabelKey:            serviceEntryLabelKey,
 		ServiceEntryServiceNameLabelKey: serviceEntryServiceNameLabelKey,
 		NamespaceList:                   namespaceList,
+		RequeueAfter:                    time.Duration(optimizeCycleTime) * time.Second,
+		QueryInterval:                   queryInterval,
+		VmdbUrl:                         vmdbUrl,
+		StepInterval:                    stepInterval,
+		ScaleupFactor:                   scaleupFactor,
+		ScaledownFactor:                 scaledownFactor,
+		MinimumWeight:                   minimumWeight,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IstioAdaptiveRequestOptimizer")
 		os.Exit(1)
@@ -202,7 +209,7 @@ func main() {
 		Client:                          mgr.GetClient(),
 		Scheme:                          mgr.GetScheme(),
 		LoggerName:                      "EndpointSliceController",
-		ServiceEntryServiceNameLabelKey: &serviceEntryServiceNameLabelKey,
+		ServiceEntryServiceNameLabelKey: serviceEntryServiceNameLabelKey,
 		NamespaceList:                   namespaceList,
 		InitialWeight:                   uint32(initialWeight),
 	}).SetupWithManager(mgr); err != nil {

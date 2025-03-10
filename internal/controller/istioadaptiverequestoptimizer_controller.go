@@ -23,8 +23,6 @@ import (
 	"istio-adaptive-least-request/internal/metrics"
 )
 
-const istioAdaptiveRequestOptimizerFinalizer = "optimization.liorfranko.github.io/finalizer"
-
 // DefaultWeightForNewEndpoints represents the default weight assigned to new endpoints in a ServiceEntry.
 const DefaultWeightForNewEndpoints uint32 = 1000
 

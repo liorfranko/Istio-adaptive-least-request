@@ -23,7 +23,7 @@ type EndpointSliceReconciler struct {
 	Scheme                          *runtime.Scheme
 	LoggerName                      string
 	DryRun                          bool
-	ServiceEntryServiceNameLabelKey *string
+	ServiceEntryServiceNameLabelKey string
 	NamespaceList                   []string
 	InitialWeight                   uint32
 }
@@ -82,7 +82,7 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		ctx,
 		logger,
 		r.Client,
-		*r.ServiceEntryServiceNameLabelKey,
+		r.ServiceEntryServiceNameLabelKey,
 		r.InitialWeight,
 		req,
 		&serviceEntry,
