@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -54,7 +55,7 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 
 func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(1).Info("Reconcile IstioAdaptiveRequestOptimizer",
+	logger.V(0).Info("Reconcile IstioAdaptiveRequestOptimizer",
 		"IstioAdaptiveRequestOptimizer.Namespace", req.Namespace,
 		"IstioAdaptiveRequestOptimizer.Name", req.Name,
 	)
@@ -64,7 +65,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			"Namespace", req.Namespace,
 			"Name", req.Name,
 		)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	logger.V(1).Info("IstioAdaptiveRequestOptimizer fetched",
 		"IstioAdaptiveRequestOptimizer", opt.Spec,
@@ -86,7 +87,10 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 	}
 	logger.V(1).Info("Service fetched", "Service", &service)
 	var serviceEntry istioClientV1.ServiceEntry
-	objectKey = client.ObjectKey{Name: opt.Name, Namespace: opt.Namespace}
+	objectKey = client.ObjectKey{
+		Name:      opt.Name,
+		Namespace: opt.Namespace,
+	}
 	if err := r.Get(ctx, objectKey, &serviceEntry); err != nil {
 		if !errors.IsNotFound(err) {
 			return ctrl.Result{}, err
@@ -197,23 +201,44 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) initServiceEntry(
 	serviceEntry *istioClientV1.ServiceEntry,
 ) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	existAddresses := make(map[string]struct{})
 	var serviceEntryEndpoints []*istioNetworkingV1.WorkloadEntry
 	for i := range endpointSlices {
 		endpointSlice := &endpointSlices[i]
+		if !endpointSlice.DeletionTimestamp.IsZero() {
+			// Skip deleted EndpointSlices
+			continue
+		}
 		for _, endpoint := range endpointSlice.Endpoints {
-			for _, address := range endpoint.Addresses {
-				workloadEntry := &istioNetworkingV1.WorkloadEntry{
-					Address: address,
-					Weight:  DefaultWeightForNewEndpoints,
-				}
-				if opt.Spec.LocalityEnabled {
-					if zonePtr := endpoint.Zone; zonePtr != nil {
-						zone := *zonePtr
-						workloadEntry.Locality = zone[:len(zone)-1] + "/" + zone
-					}
-				}
-				serviceEntryEndpoints = append(serviceEntryEndpoints, workloadEntry)
+			if readyPtr := endpoint.Conditions.Ready; readyPtr == nil || !*readyPtr {
+				logger.Info("Endpoint is not ready", "Endpoint", endpoint)
+				continue
 			}
+			var address string
+			if addresses := endpoint.Addresses; len(addresses) > 0 {
+				address = addresses[0]
+			}
+			if address == "" {
+				// TODO(romang): check why this happens, if it is
+				continue
+			}
+			if _, ok := existAddresses[address]; ok {
+				// Skip duplicate endpoints
+				// https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/#duplicate-endpoints
+				continue
+			}
+			existAddresses[address] = struct{}{}
+			workloadEntry := &istioNetworkingV1.WorkloadEntry{
+				Address: address,
+				Weight:  DefaultWeightForNewEndpoints,
+			}
+			if opt.Spec.LocalityEnabled {
+				if zonePtr := endpoint.Zone; zonePtr != nil {
+					zone := *zonePtr
+					workloadEntry.Locality = zone[:len(zone)-1] + "/" + zone
+				}
+			}
+			serviceEntryEndpoints = append(serviceEntryEndpoints, workloadEntry)
 		}
 	}
 	*serviceEntry = istioClientV1.ServiceEntry{
@@ -272,8 +297,15 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) SetupWithManager(mgr ctrl.Mana
 	namespacePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return helpers.NamespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
 	})
+	ignoreStatusUpdatesPredicate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			// Only reconcile if the spec has changed
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+		},
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&api.IstioAdaptiveRequestOptimizer{}).
 		WithEventFilter(namespacePredicate).
+		WithEventFilter(ignoreStatusUpdatesPredicate).
 		Complete(r)
 }

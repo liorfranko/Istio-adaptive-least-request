@@ -190,7 +190,7 @@ func addPods(logger logr.Logger, pods []corev1.Pod, podsInfo []tPodInfo) []tPodI
 	for i := range pods {
 		pod := &pods[i]
 		// Skip pods that are being deleted
-		if pod.DeletionTimestamp.IsZero() {
+		if !pod.DeletionTimestamp.IsZero() {
 			logger.V(1).Info("Skipping pod: marked for deletion", "podName", pod.Name)
 			continue
 		}

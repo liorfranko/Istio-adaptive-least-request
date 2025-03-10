@@ -28,7 +28,6 @@ import (
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"istio-adaptive-least-request/internal/helpers"
@@ -84,11 +83,10 @@ func handleEndpointUpdate(
 	c client.Client,
 	serviceEntryServiceNameLabelKey string,
 	initialWeight uint32,
-	req ctrl.Request,
 	serviceEntry *istioClientV1.ServiceEntry,
 	localityEnabled bool,
 ) ([]*istioNetworkingV1.WorkloadEntry, bool, error) {
-	ok, unlock, checkTouchedAndReset := tryLock(req.Namespace, req.Name)
+	ok, unlock, checkTouchedAndReset := tryLock(serviceEntry.Namespace, serviceEntry.Name)
 	if !ok {
 		return nil, false, nil
 	}
@@ -105,15 +103,15 @@ func handleEndpointUpdate(
 	labelSelector := client.MatchingLabels{
 		discoveryv1.LabelServiceName: originalServiceName,
 	}
-	if err := c.List(ctx, &endpointSlices, client.InNamespace(req.Namespace), labelSelector); err != nil {
+	if err := c.List(ctx, &endpointSlices, client.InNamespace(serviceEntry.Namespace), labelSelector); err != nil {
 		logger.Error(err, "Failed to list EndpointSlices for service",
-			"Namespace", req.Namespace,
+			"Namespace", serviceEntry.Namespace,
 			"Name", originalServiceName,
 		)
 		return nil, checkTouchedAndReset(), err
 	}
 	if len(endpointSlices.Items) == 0 {
-		logger.Info("No EndpointSlices found for service", "Namespace", req.Namespace, "Name", originalServiceName)
+		logger.Info("No EndpointSlices found for service", "Namespace", serviceEntry.Namespace, "Name", originalServiceName)
 		return nil, checkTouchedAndReset(), nil // No endpoints to process
 	}
 	addressToWorkloadEntry := make(map[string]*istioNetworkingV1.WorkloadEntry)
@@ -166,7 +164,11 @@ func handleEndpointUpdate(
 	}
 
 	var coreService corev1.Service
-	if err := c.Get(ctx, req.NamespacedName, &coreService); err != nil {
+	objectKey := client.ObjectKey{
+		Namespace: serviceEntry.Namespace,
+		Name:      originalServiceName,
+	}
+	if err := c.Get(ctx, objectKey, &coreService); err != nil {
 		logger.Error(err, "Failed to fetch Service.")
 		return nil, checkTouchedAndReset(), err
 	}

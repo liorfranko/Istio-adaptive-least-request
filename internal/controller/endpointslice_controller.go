@@ -46,8 +46,8 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		Name:      serviceName,
 	}
 	if err := r.Client.Get(ctx, key, &serviceEntry); err != nil {
-		logger.Error(err, "Failed to list ServiceEntry", "Namespace", req.Namespace, "ServiceName", serviceName)
-		return ctrl.Result{}, err
+		// logger.Error(err, "Failed to list ServiceEntry", "Namespace", req.Namespace, "ServiceName", serviceName)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	ownerReferences := serviceEntry.OwnerReferences
 	if len(ownerReferences) == 0 {
@@ -70,7 +70,6 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		r.Client,
 		r.ServiceEntryServiceNameLabelKey,
 		r.InitialWeight,
-		req,
 		&serviceEntry,
 		opt.Spec.LocalityEnabled,
 	)
