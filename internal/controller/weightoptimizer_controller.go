@@ -196,6 +196,13 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	// Update the status of the IstioAdaptiveRequestOptimizer
+	istioOptimizer.Status.LastOptimizedTime = &metav1.Time{Time: time.Now()}
+	if err := r.Status().Update(ctx, &istioOptimizer); err != nil {
+		logger.Error(err, "Error updating IstioAdaptiveRequestOptimizer status, retry reconcile", "service.Name", istioOptimizer.Name)
+		return ctrl.Result{}, err
+	}
+
 	// Requeue to process services periodically
 	return ctrl.Result{RequeueAfter: r.RequeueAfter * time.Second}, nil
 }
@@ -367,7 +374,7 @@ func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioO
 		return err
 	}
 
-	if shouldSkipFallback(weightOptimizer) {
+	if shouldSkipFallback(istioOptimizer) {
 		logger.Info("Recent optimization detected; skipping fallback strategy")
 		return nil
 	}
@@ -382,14 +389,12 @@ func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioO
 }
 
 // Helper function to decide whether to skip fallback based on optimization times.
-func shouldSkipFallback(weightOptimizer *optimizationv1alpha1.WeightOptimizer) bool {
-	minLastOptimizedTime := metav1.Now()
-	for _, endpoint := range weightOptimizer.Spec.Endpoints {
-		if endpoint.LastOptimized.Before(&minLastOptimizedTime) {
-			minLastOptimizedTime = endpoint.LastOptimized
-		}
+func shouldSkipFallback(istioOptimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) bool {
+	lastOptimizedTime := istioOptimizer.Status.LastOptimizedTime
+	if lastOptimizedTime == nil {
+		return false
 	}
-	return time.Since(minLastOptimizedTime.Time) < 5*time.Minute
+	return time.Since(lastOptimizedTime.Time) < 5*time.Minute
 }
 
 // Reset weights to default values and update the WeightOptimizer.
@@ -709,7 +714,11 @@ func (r *WeightOptimizerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return false
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return helpers.NamespaceInFilteredList(e.ObjectNew.GetNamespace(), r.NamespaceList)
+			if !helpers.NamespaceInFilteredList(e.ObjectNew.GetNamespace(), r.NamespaceList) {
+				return false
+			}
+			// Ignore updates to the status in the IstioLatencyOptimizer
+			return e.ObjectNew.GetGeneration() != e.ObjectOld.GetGeneration()
 		},
 	}
 	return ctrl.NewControllerManagedBy(mgr).

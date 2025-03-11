@@ -8,6 +8,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -428,8 +429,15 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) SetupWithManager(mgr ctrl.Mana
 	namespacePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return helpers.NamespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
 	})
+	// ignore status changes
+	statusPredicate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+		},
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&optimizationv1alpha1.IstioAdaptiveRequestOptimizer{}).
 		WithEventFilter(namespacePredicate).
+		WithEventFilter(statusPredicate).
 		Complete(r)
 }
