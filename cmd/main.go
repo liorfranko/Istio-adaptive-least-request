@@ -229,6 +229,7 @@ func main() {
 		RequeueAfter:                  time.Duration(optimizeCycleTime),
 		MaximumWeight:                 maximumWeight,
 		MinimumWeight:                 minimumWeight,
+		InitialWeight:                 initialWeight,
 		QueryInterval:                 queryInterval,
 		StepInterval:                  stepInterval,
 		MinOptimizeCpuDistancePercent: minOptimizeCpuDistancePercent,

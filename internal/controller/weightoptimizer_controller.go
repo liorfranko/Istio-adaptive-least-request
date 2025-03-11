@@ -58,6 +58,7 @@ type WeightOptimizerReconciler struct {
 	RequeueAfter                  time.Duration
 	MinimumWeight                 int
 	MaximumWeight                 int
+	InitialWeight                 int
 	QueryInterval                 string
 	StepInterval                  string
 	MinOptimizeCpuDistancePercent float64
@@ -150,19 +151,18 @@ func (r *WeightOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	//logger.V(1).Info("Pods fetched", "Pods", podsInfo)
 	// Get the metrics from VictoriaMetrics for the service and protocol
-	getPodMetricsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	getPodMetricsCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	podsMetrics, err := r.getPodMetrics(getPodMetricsCtx, istioOptimizer.Name, istioOptimizer.Namespace, podsInfo)
 	if err != nil {
 		// If there is a problem with pulling the metrics from VictoriaMetrics, log an error and continue to the next port
 		customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "get_metrics_from_vm", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
-		err := r.fallbackStrategy(ctx, &istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap, podsInfo)
-		if err != nil {
+		if err := r.fallbackStrategy(ctx, &istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap, podsInfo); err != nil {
 			customMetrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName, "type": "fallback_strategy", "name": istioOptimizer.Name, "namespace": istioOptimizer.Namespace}).Inc()
 			return ctrl.Result{}, err
 		}
 		logger.Info("continue to the next port if there is", "service.Name", istioOptimizer.Name)
-		return ctrl.Result{}, err
+		return ctrl.Result{RequeueAfter: r.RequeueAfter * time.Second}, nil
 	}
 
 	// Update pod metrics based on the response from VictoriaMetrics
@@ -368,15 +368,15 @@ func (r *WeightOptimizerReconciler) fallbackStrategy(ctx context.Context, istioO
 	logger := log.FromContext(ctx).WithName(r.LoggerName).WithValues("service.name", istioOptimizer.Name, "service.namespace", istioOptimizer.Namespace)
 	logger.Info("Initiating fallback strategy check")
 
+	if shouldSkipFallback(istioOptimizer) {
+		logger.Info("Recent optimization detected; skipping fallback strategy")
+		return nil
+	}
+
 	weightOptimizer, err := r.ensureWeightOptimizer(ctx, istioOptimizer, objectKey, serviceEntryWeightsMap, serviceEntryLocalityMap)
 	if err != nil {
 		logger.Error(err, "Failed to ensure WeightOptimizer is available")
 		return err
-	}
-
-	if shouldSkipFallback(istioOptimizer) {
-		logger.Info("Recent optimization detected; skipping fallback strategy")
-		return nil
 	}
 
 	logger.Info("Weights reset to default due to timeout")
@@ -394,7 +394,7 @@ func shouldSkipFallback(istioOptimizer *optimizationv1alpha1.IstioAdaptiveReques
 	if lastOptimizedTime == nil {
 		return false
 	}
-	return time.Since(lastOptimizedTime.Time) < 5*time.Minute
+	return time.Since(lastOptimizedTime.Time) < 1*time.Minute
 }
 
 // Reset weights to default values and update the WeightOptimizer.
@@ -405,7 +405,7 @@ func (r *WeightOptimizerReconciler) resetWeights(ctx context.Context, weightOpti
 		weightOptimizer.Spec.Endpoints = append(weightOptimizer.Spec.Endpoints, optimizationv1alpha1.Endpoint{
 			IP:               podInfo.PodAddress,
 			Name:             podInfo.PodName,
-			Weight:           300,
+			Weight:           uint32(r.InitialWeight),
 			Multiplier:       1,
 			Alpha:            0,
 			Distance:         0,
