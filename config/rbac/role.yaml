@@ -19,8 +19,6 @@ rules:
   verbs:
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - networking.istio.io
@@ -28,7 +26,6 @@ rules:
   - serviceentries
   verbs:
   - create
-  - delete
   - get
   - list
   - patch
@@ -47,8 +44,6 @@ rules:
   resources:
   - istioadaptiverequestoptimizers
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
