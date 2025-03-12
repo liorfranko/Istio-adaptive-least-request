@@ -237,13 +237,14 @@ func fallbackStrategy(
 	client clientPkg.Client,
 	opt *api.IstioAdaptiveRequestOptimizer,
 	serviceEntry *istionetworkingv1.ServiceEntry,
+	resetWeight uint32,
 ) error {
 	logger.Info("Initiating fallback strategy check")
 	if shouldSkipFallback(opt) {
 		logger.Info("Recent optimization detected; skipping fallback strategy")
 		return nil
 	}
-	if err := resetWeights(ctx, logger, client, serviceEntry); err != nil {
+	if err := resetWeights(ctx, logger, client, serviceEntry, resetWeight); err != nil {
 		return err
 	}
 	logger.Info("Weights reset to default due to timeout")
@@ -256,7 +257,7 @@ func shouldSkipFallback(opt *api.IstioAdaptiveRequestOptimizer) bool {
 	if optimizedTime == nil {
 		return false
 	}
-	return time.Since(optimizedTime.Time) < 5*time.Minute
+	return time.Since(optimizedTime.Time) < 10*time.Minute
 }
 
 func resetWeights(
@@ -264,15 +265,19 @@ func resetWeights(
 	logger logr.Logger,
 	client clientPkg.Client,
 	serviceEntry *istionetworkingv1.ServiceEntry,
+	resetWeight uint32,
 ) error {
+	logger.Info("Resetting weights to default values", "serviceEntry", serviceEntry.Name)
 	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
-		logger.Info("Resetting endpoint to default values", "endpoint", workloadEntry.Address)
-		workloadEntry.Weight = 300
+		workloadEntry.Weight = resetWeight
 	}
+	logger.Info("Trying to update serviceEntry", "serviceEntry", serviceEntry.Name)
 	if err := client.Update(ctx, serviceEntry); err != nil {
-		logger.Error(err, "Failed to update serviceEntry")
+		logger.Error(err, "Failed to update serviceEntry", "serviceEntry", serviceEntry.Name)
 		return err
 	}
+	updateMetrics(serviceEntry)
+	logger.Info("ServiceEntry updated successfully", "serviceEntry", serviceEntry.Name)
 	return nil
 }
 

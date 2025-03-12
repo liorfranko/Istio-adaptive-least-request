@@ -42,6 +42,7 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 	ScaleupFactor                   float64
 	ScaledownFactor                 float64
 	MinimumWeight                   int
+	InitialWeight                   int
 }
 
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch;create;update;patch;delete
@@ -150,7 +151,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 				"name":      opt.Name,
 				"namespace": opt.Namespace,
 			}).Inc()
-			if err := fallbackStrategy(ctx, logger, r.Client, &opt, &serviceEntry); err != nil {
+			if err := fallbackStrategy(ctx, logger, r.Client, &opt, &serviceEntry, uint32(r.MinimumWeight)); err != nil {
 				metrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName,
 					"type":      "fallback_strategy",
 					"name":      opt.Name,
@@ -158,8 +159,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 				}).Inc()
 				return ctrl.Result{}, err
 			}
-			logger.Info("continue to the next port if there is", "service.Name", opt.Name)
-			return ctrl.Result{}, err
+			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 		}
 		enrichPodMetrics(logger, podAddressToPodMetrics)
 		distributeWeightsBasedOnCPU(
@@ -174,6 +174,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			logger.Error(err, "Failed to validate or update weights.")
 			return ctrl.Result{}, err
 		}
+		updateMetrics(&serviceEntry)
 	}
 	status := &opt.Status
 	now := metav1.Now()
