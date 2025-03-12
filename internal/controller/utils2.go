@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,7 +80,6 @@ func handleEndpointUpdate(
 	ctx context.Context,
 	logger logr.Logger,
 	c client.Client,
-	serviceEntryServiceNameLabelKey string,
 	initialWeight uint32,
 	serviceEntry *istioClientV1.ServiceEntry,
 	localityEnabled bool,
@@ -91,27 +89,22 @@ func handleEndpointUpdate(
 		return nil, false, nil
 	}
 	defer unlock()
-	// Extract the original service name from the ServiceEntry's labels.
-	originalServiceName := serviceEntry.Labels[serviceEntryServiceNameLabelKey]
-	if originalServiceName == "" {
-		logger.Error(nil, "ServiceEntry does not contain the expected label.",
-			"Label", serviceEntryServiceNameLabelKey,
-		)
-		return nil, checkTouchedAndReset(), fmt.Errorf("ServiceEntry does not contain the expected label %s", serviceEntryServiceNameLabelKey)
-	}
 	var endpointSlices discoveryv1.EndpointSliceList
 	labelSelector := client.MatchingLabels{
-		discoveryv1.LabelServiceName: originalServiceName,
+		discoveryv1.LabelServiceName: serviceEntry.Name,
 	}
 	if err := c.List(ctx, &endpointSlices, client.InNamespace(serviceEntry.Namespace), labelSelector); err != nil {
 		logger.Error(err, "Failed to list EndpointSlices for service",
 			"Namespace", serviceEntry.Namespace,
-			"Name", originalServiceName,
+			"Name", serviceEntry.Name,
 		)
 		return nil, checkTouchedAndReset(), err
 	}
 	if len(endpointSlices.Items) == 0 {
-		logger.Info("No EndpointSlices found for service", "Namespace", serviceEntry.Namespace, "Name", originalServiceName)
+		logger.Info("No EndpointSlices found for service",
+			"Namespace", serviceEntry.Namespace,
+			"Name", serviceEntry.Name,
+		)
 		return nil, checkTouchedAndReset(), nil // No endpoints to process
 	}
 	addressToWorkloadEntry := make(map[string]*istioNetworkingV1.WorkloadEntry)
@@ -166,7 +159,7 @@ func handleEndpointUpdate(
 	var coreService corev1.Service
 	objectKey := client.ObjectKey{
 		Namespace: serviceEntry.Namespace,
-		Name:      originalServiceName,
+		Name:      serviceEntry.Name,
 	}
 	if err := c.Get(ctx, objectKey, &coreService); err != nil {
 		logger.Error(err, "Failed to fetch Service.")

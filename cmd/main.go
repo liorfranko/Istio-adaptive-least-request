@@ -63,7 +63,6 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
-	var serviceEntryLabelKey, serviceEntryServiceNameLabelKey string
 	var namespaces string
 	var vmdbUrl string
 	var optimizeCycleTime int
@@ -84,8 +83,6 @@ func main() {
 		"If set the metrics endpoint is served securely")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.StringVar(&serviceEntryLabelKey, "serviceentry-label", "istio.adaptive.request.optimizer/optimize", "The label to use for setting that the ServiceEntry object is optimized")
-	flag.StringVar(&serviceEntryServiceNameLabelKey, "serviceentry-service-name-label", "istio.adaptive.request.optimizer/service-name", "The label to use for setting the service name in the ServiceEntry object")
 	flag.StringVar(&namespaces, "namespaces", "", "Comma-separated list of namespaces to watch")
 	flag.StringVar(&queryInterval, "query-interval", "1m", "The time range over which to aggregate metrics when querying the VMDB service")
 	flag.StringVar(&stepInterval, "step-interval", "20s", "The granularity of the data points returned by Prometheus when querying the VMDB service")
@@ -188,31 +185,28 @@ func main() {
 	}
 
 	if err = (&controller.IstioAdaptiveRequestOptimizerReconciler{
-		Client:                          mgr.GetClient(),
-		Scheme:                          mgr.GetScheme(),
-		LoggerName:                      "IstioAdaptiveRequestOptimizer",
-		ServiceEntryLabelKey:            serviceEntryLabelKey,
-		ServiceEntryServiceNameLabelKey: serviceEntryServiceNameLabelKey,
-		NamespaceList:                   namespaceList,
-		RequeueAfter:                    time.Duration(optimizeCycleTime) * time.Second,
-		QueryInterval:                   queryInterval,
-		VmdbUrl:                         vmdbUrl,
-		StepInterval:                    stepInterval,
-		ScaleupFactor:                   scaleupFactor,
-		ScaledownFactor:                 scaledownFactor,
-		MinimumWeight:                   minimumWeight,
-		InitialWeight:                   initialWeight,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		LoggerName:      "IstioAdaptiveRequestOptimizer",
+		NamespaceList:   namespaceList,
+		RequeueAfter:    time.Duration(optimizeCycleTime) * time.Second,
+		QueryInterval:   queryInterval,
+		VmdbUrl:         vmdbUrl,
+		StepInterval:    stepInterval,
+		ScaleupFactor:   scaleupFactor,
+		ScaledownFactor: scaledownFactor,
+		MinimumWeight:   minimumWeight,
+		InitialWeight:   initialWeight,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IstioAdaptiveRequestOptimizer")
 		os.Exit(1)
 	}
 	if err = (&controller.EndpointSliceReconciler{
-		Client:                          mgr.GetClient(),
-		Scheme:                          mgr.GetScheme(),
-		LoggerName:                      "EndpointSliceController",
-		ServiceEntryServiceNameLabelKey: serviceEntryServiceNameLabelKey,
-		NamespaceList:                   namespaceList,
-		InitialWeight:                   uint32(initialWeight),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		LoggerName:    "EndpointSlice",
+		NamespaceList: namespaceList,
+		InitialWeight: uint32(initialWeight),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Endpoint")
 		os.Exit(1)

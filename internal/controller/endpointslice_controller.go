@@ -20,11 +20,10 @@ import (
 // EndpointSliceReconciler reconciles an EndpointSlice object
 type EndpointSliceReconciler struct {
 	client.Client
-	Scheme                          *runtime.Scheme
-	LoggerName                      string
-	ServiceEntryServiceNameLabelKey string
-	NamespaceList                   []string
-	InitialWeight                   uint32
+	Scheme        *runtime.Scheme
+	LoggerName    string
+	NamespaceList []string
+	InitialWeight uint32
 }
 
 //+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
@@ -68,7 +67,6 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		ctx,
 		logger,
 		r.Client,
-		r.ServiceEntryServiceNameLabelKey,
 		r.InitialWeight,
 		&serviceEntry,
 		opt.Spec.LocalityEnabled,

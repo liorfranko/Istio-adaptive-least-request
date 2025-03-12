@@ -30,19 +30,17 @@ const DefaultWeightForNewEndpoints uint32 = 1000
 // IstioAdaptiveRequestOptimizerReconciler reconciles a IstioAdaptiveRequestOptimizer object
 type IstioAdaptiveRequestOptimizerReconciler struct {
 	client.Client
-	Scheme                          *runtime.Scheme
-	LoggerName                      string
-	ServiceEntryLabelKey            string
-	ServiceEntryServiceNameLabelKey string
-	NamespaceList                   []string
-	RequeueAfter                    time.Duration
-	QueryInterval                   string
-	VmdbUrl                         string
-	StepInterval                    string
-	ScaleupFactor                   float64
-	ScaledownFactor                 float64
-	MinimumWeight                   int
-	InitialWeight                   int
+	Scheme          *runtime.Scheme
+	LoggerName      string
+	NamespaceList   []string
+	RequeueAfter    time.Duration
+	QueryInterval   string
+	VmdbUrl         string
+	StepInterval    string
+	ScaleupFactor   float64
+	ScaledownFactor float64
+	MinimumWeight   int
+	InitialWeight   int
 }
 
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch;create;update;patch;delete
@@ -250,10 +248,6 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) initServiceEntry(
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      service.Name,
 			Namespace: service.Namespace,
-			Labels: map[string]string{
-				r.ServiceEntryLabelKey:            "true",
-				r.ServiceEntryServiceNameLabelKey: service.Name,
-			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					Name:       opt.Name,
