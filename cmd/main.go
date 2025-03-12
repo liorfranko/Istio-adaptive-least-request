@@ -66,10 +66,8 @@ func main() {
 	var namespaces string
 	var vmdbUrl string
 	var optimizeCycleTime int
-	var minimumWeight, maximumWeight, initialWeight int
+	var minimumWeight, initialWeight int
 	var queryInterval, stepInterval string
-	var minOptimizeCpuDistancePercent, cpuDistanceMultiplierPercent float64
-	var newEndpointsPercentileWeight int
 	var scaleupFactor float64
 	var scaledownFactor float64
 
@@ -85,17 +83,13 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&namespaces, "namespaces", "", "Comma-separated list of namespaces to watch")
 	flag.StringVar(&queryInterval, "query-interval", "1m", "The time range over which to aggregate metrics when querying the VMDB service")
-	flag.StringVar(&stepInterval, "step-interval", "20s", "The granularity of the data points returned by Prometheus when querying the VMDB service")
-	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 30, "The time in seconds to run the optimization cycle")
+	flag.StringVar(&stepInterval, "step-interval", "60s", "The granularity of the data points returned by Prometheus when querying the VMDB service")
+	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 60, "The time in seconds to run the optimization cycle")
 	flag.IntVar(&minimumWeight, "minimum-weight", 100, "The minimum weight for an endpoint to get, increasing this will make the split between the slowest and fastest endpoints smaller")
-	flag.IntVar(&maximumWeight, "maximum-weight", 600, "The maximum weight to use for the endpoints, decreasing this will make the split between the slowest and fastest endpoints smaller")
 	flag.IntVar(&initialWeight, "initial-weight", 400, "The initial weight to use for the endpoints, this value will be used for new endpoints")
 	// Define flags with percentage names
-	flag.Float64Var(&minOptimizeCpuDistancePercent, "min-optimize-cpu-distance-percent", 5.0, "The minimum distance percentage between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
-	flag.Float64Var(&cpuDistanceMultiplierPercent, "cpu-distance-multiplier-percent", 1.0, "The multiplier percentage to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplierPercent)")
 	flag.Float64Var(&scaleupFactor, "scale-up-factor", 0.15, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scaleupFactor")
 	flag.Float64Var(&scaledownFactor, "scale-down-factor", 0.15, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scaleupFactor")
-	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 10, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
 	flag.StringVar(&vmdbUrl, "vmdb-url", "http://ilo-vm-single-server:8428", "The URL of the VMDB service")
 
 	opts := zap.Options{}
@@ -103,14 +97,11 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	var namespaceList []string
-	if namespaces != "" {
-		namespaceList = strings.Split(namespaces, ",")
-	}
-
-	if newEndpointsPercentileWeight < 0 || newEndpointsPercentileWeight > 100 {
-		setupLog.Error(nil, "new-endpoints-percentile-weight must be between 0 and 100")
+	if len(namespaces) == 0 {
+		setupLog.Error(nil, "Failed to set up namespaces", "namespaces", namespaces)
 		os.Exit(1)
 	}
+	namespaceList = strings.Split(namespaces, ",")
 
 	if optimizeCycleTime < 0 || optimizeCycleTime > 360 {
 		setupLog.Error(nil, "optimize-time must be between 0 and 360")
