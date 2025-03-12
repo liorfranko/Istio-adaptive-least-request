@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/go-logr/logr"
 	istioNetworkingV1 "istio.io/api/networking/v1"
@@ -101,6 +103,49 @@ func endpointSliceNameToServiceName(endpointSliceName string) string {
 		return ""
 	}
 	return endpointSliceName[:lastHyphenIndex]
+}
+
+type tKeyToMuxKey struct {
+	Namespace string
+	Name      string
+}
+
+type tMarkMux struct {
+	mux     sync.Mutex
+	touched int64
+}
+
+func (m *tMarkMux) checkTouchedAndReset() bool {
+	return atomic.SwapInt64(&m.touched, 0) > 0
+}
+
+var (
+	keyToMuxMux sync.Mutex
+	keyToMux    = make(map[tKeyToMuxKey]*tMarkMux)
+)
+
+func getMux(namespace, name string) *tMarkMux {
+	key := tKeyToMuxKey{
+		Namespace: namespace,
+		Name:      name,
+	}
+	keyToMuxMux.Lock()
+	defer keyToMuxMux.Unlock()
+	markMux, ok := keyToMux[key]
+	if !ok {
+		markMux = new(tMarkMux)
+		keyToMux[key] = markMux
+	}
+	return markMux
+}
+
+func tryLock(namespace, name string) (bool, func(), func() bool) {
+	markMux := getMux(namespace, name)
+	if !markMux.mux.TryLock() {
+		atomic.AddInt64(&markMux.touched, 1)
+		return false, nil, nil
+	}
+	return true, markMux.mux.Unlock, markMux.checkTouchedAndReset
 }
 
 func handleEndpointUpdate(
