@@ -96,6 +96,8 @@ func main() {
 	// Define Log Level of the application
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	// Split the namespaces string into a list
 	var namespaceList []string
 	if len(namespaces) == 0 {
 		setupLog.Error(nil, "Failed to set up namespaces", "namespaces", namespaces)
@@ -103,13 +105,8 @@ func main() {
 	}
 	namespaceList = strings.Split(namespaces, ",")
 
-	if optimizeCycleTime < 0 || optimizeCycleTime > 360 {
-		setupLog.Error(nil, "optimize-time must be between 0 and 360")
-		os.Exit(1)
-	}
-
-	if optimizeCycleTime == 0 {
-		setupLog.Info("optimize-time is set to 0, the optimize cycle can't be disabled")
+	if optimizeCycleTime <= 0 || optimizeCycleTime > 600 {
+		setupLog.Error(nil, "optimize-time must be between 0 and 600 seconds")
 		os.Exit(1)
 	}
 
