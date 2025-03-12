@@ -7,15 +7,6 @@ import (
 	customMetrics "istio-adaptive-least-request/internal/metrics"
 )
 
-func Remove[T comparable](dst, slice []T, s T) []T {
-	for _, item := range slice {
-		if item != s {
-			dst = append(dst, item)
-		}
-	}
-	return dst
-}
-
 // SafeDereferenceAppProtocol safely dereferences a pointer to a string (appProtocol).
 // It returns the dereference string if it's not nil, or a default value (e.g., "TCP") if it's nil.
 func SafeDereferenceAppProtocol(appProtocolPtr *string) string {
