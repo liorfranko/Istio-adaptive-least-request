@@ -64,10 +64,7 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 
 func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(0).Info("Reconcile IstioAdaptiveRequestOptimizer",
-		"IstioAdaptiveRequestOptimizer.Namespace", req.Namespace,
-		"IstioAdaptiveRequestOptimizer.Name", req.Name,
-	)
+	logger.Info("Starting reconcile IstioAdaptiveRequestOptimizer")
 	var opt api.IstioAdaptiveRequestOptimizer
 	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found",
@@ -141,6 +138,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			r.StepInterval,
 		)
 		if err != nil {
+			logger.Error(err, "Failed to get pod metrics")
 			// If there is a problem with pulling the metrics from VictoriaMetrics, log an error and continue to the next port
 			metrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName,
 				"type":      "get_metrics_from_vm",
@@ -251,12 +249,9 @@ func getCPUMetrics(
 	vmDbUrl string,
 	stepInterval string,
 ) (map[string]float64, error) {
-	logger.Info("Querying CPU from VictoriaMetrics for service",
-		"service.name", service,
-		"service.namespace", namespace,
-	)
+	logger.Info("Querying CPU from VictoriaMetrics for service")
 	query := fmt.Sprintf(
-		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) (kube_pod_info{namespace="%s, pod=~"%s.*"})) by (pod_ip)`,
+		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) (kube_pod_info{namespace="%s", pod=~"%s.*"})) by (pod_ip)`,
 		namespace,
 		service,
 		queryInterval,

@@ -40,7 +40,6 @@ type EndpointSliceReconciler struct {
 
 func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(1).Info("Reconcile EndpointSlice", "Namespace", req.Namespace, "Name", req.Name)
 	serviceName := endpointSliceNameToServiceName(req.Name)
 	if serviceName == "" {
 		logger.Info("Failed to extract service name from EndpointSlice name")
@@ -70,6 +69,7 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	logger.Info("Starting Reconcile EndpointSlice")
 	oldWorkloads, requeue, err := handleEndpointUpdate(
 		ctx,
 		logger,
