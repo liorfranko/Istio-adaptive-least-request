@@ -1,4 +1,4 @@
-package helpers
+package controller
 
 import (
 	"testing"
@@ -9,17 +9,17 @@ import (
 func TestDiff(t *testing.T) {
 	slice := []*istioNetworkingV1.WorkloadEntry{{Address: "a"}, {Address: "b"}, {Address: "c"}, {Address: "k"}}
 	slice2 := []*istioNetworkingV1.WorkloadEntry{{Address: "a"}, {Address: "b"}, {Address: "c"}, {Address: "d"}, {Address: "e"}}
-	diff := Diff(nil, slice, slice2)
-	if len(diff) != 3 {
-		t.Errorf("Expected 2, got %d", len(diff))
+	diff1 := diff(nil, slice, slice2)
+	if len(diff1) != 3 {
+		t.Errorf("Expected 2, got %d", len(diff1))
 	}
-	diff2 := Diff(nil, slice2, slice)
+	diff2 := diff(nil, slice2, slice)
 	if len(diff2) != 3 {
 		t.Errorf("Expected 2, got %d", len(diff2))
 	}
 
 	expected := []string{"d", "e", "k"}
-	for i, d := range diff {
+	for i, d := range diff1 {
 		if d.Address != expected[i] {
 			t.Errorf("Expected %s, got %s", expected[i], d.Address)
 		}

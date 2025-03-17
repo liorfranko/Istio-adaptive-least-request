@@ -31,7 +31,6 @@ import (
 	clientPkg "sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "istio-adaptive-least-request/api/v1alpha1"
-	"istio-adaptive-least-request/internal/helpers"
 	"istio-adaptive-least-request/internal/metrics"
 )
 
@@ -600,6 +599,14 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) initServiceEntry(
 	)
 }
 
+// It returns the dereference string if it's not nil, or a default value (e.g., "TCP") if it's nil.
+func safeDereferenceAppProtocol(appProtocolPtr *string) string {
+	if appProtocolPtr != nil {
+		return *appProtocolPtr
+	}
+	return "TCP"
+}
+
 func appendCoreServicePortsToIstioServicePorts(
 	istioServicePorts []*istioNetworkingV1.ServicePort,
 	coreServicePorts []corev1.ServicePort,
@@ -608,7 +615,7 @@ func appendCoreServicePortsToIstioServicePorts(
 		port := &coreServicePorts[i]
 		istioServicePort := &istioNetworkingV1.ServicePort{
 			Number:     uint32(port.Port),
-			Protocol:   helpers.SafeDereferenceAppProtocol(port.AppProtocol),
+			Protocol:   safeDereferenceAppProtocol(port.AppProtocol),
 			Name:       port.Name,
 			TargetPort: uint32(port.TargetPort.IntValue()),
 		}
@@ -617,10 +624,19 @@ func appendCoreServicePortsToIstioServicePorts(
 	return istioServicePorts
 }
 
+func namespaceInFilteredList(namespace string, filteredNamespaces []string) bool {
+	for _, ns := range filteredNamespaces {
+		if namespace == ns {
+			return true
+		}
+	}
+	return false
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *IstioAdaptiveRequestOptimizerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	namespacePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return helpers.NamespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
+		return namespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
 	})
 	ignoreStatusUpdatesPredicate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
