@@ -257,10 +257,12 @@ func getCPUMetrics(
 		"service.namespace", namespace,
 	)
 	query := fmt.Sprintf(
-		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) (kube_pod_info)) by (pod_ip)`,
+		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) (kube_pod_info{namespace="%s, pod=~"%s.*"})) by (pod_ip)`,
 		namespace,
 		service,
 		queryInterval,
+		namespace,
+		service,
 	)
 	logger.V(1).Info("query", "query", query)
 	// Start timer
