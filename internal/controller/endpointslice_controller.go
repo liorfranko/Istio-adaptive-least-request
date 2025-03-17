@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"github.com/prometheus/client_golang/prometheus"
+	"istio-adaptive-least-request/internal/metrics"
 	"slices"
 	"strings"
 	"sync"
@@ -20,7 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	api "istio-adaptive-least-request/api/v1alpha1"
-	"istio-adaptive-least-request/internal/helpers"
 )
 
 // EndpointSliceReconciler reconciles an EndpointSlice object
@@ -38,7 +39,6 @@ type EndpointSliceReconciler struct {
 
 func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(1).Info("Reconcile EndpointSlice", "Namespace", req.Namespace, "Name", req.Name)
 	serviceName := endpointSliceNameToServiceName(req.Name)
 	if serviceName == "" {
 		logger.Info("Failed to extract service name from EndpointSlice name")
@@ -68,6 +68,7 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	logger.Info("Starting Reconcile EndpointSlice")
 	oldWorkloads, requeue, err := handleEndpointUpdate(
 		ctx,
 		logger,
@@ -81,17 +82,32 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			Requeue: requeue,
 		}, err
 	}
-	cleanupPodMetrics(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
+	cleanupPodMetricsFromWorkloadEntries(oldWorkloads, opt.Spec.ServiceNamespace, req.Name)
 	return ctrl.Result{
 		Requeue: requeue,
 	}, nil
 }
 
-func cleanupPodMetrics(oldWorkloadEntries []*istioNetworkingV1.WorkloadEntry, serviceEntryNamespace, serviceEntryName string) {
+func cleanupPodMetrics(serviceNamespace, serviceName, podIP, locality string) int {
+	// Define Prometheus metrics to be removed
+	removedMetrics := 0
+	metricsToRemove := []*prometheus.GaugeVec{
+		metrics.WeightMetric,
+	}
+	for _, metricVec := range metricsToRemove {
+		if !metricVec.Delete(prometheus.Labels{"service_namespace": serviceNamespace, "service_name": serviceName, "pod_ip": podIP, "locality": locality}) {
+			continue
+		}
+		removedMetrics++
+	}
+	return removedMetrics
+}
+
+func cleanupPodMetricsFromWorkloadEntries(oldWorkloadEntries []*istioNetworkingV1.WorkloadEntry, serviceEntryNamespace, serviceEntryName string) {
 	for _, workloadEntry := range oldWorkloadEntries {
 		podAddress := workloadEntry.Address
 		podZone := getLocalityForMetric(workloadEntry.Locality)
-		helpers.CleanupPodMetrics(serviceEntryNamespace, serviceEntryName, podAddress, podZone)
+		cleanupPodMetrics(serviceEntryNamespace, serviceEntryName, podAddress, podZone)
 	}
 }
 
@@ -145,6 +161,32 @@ func tryLock(namespace, name string) (bool, func(), func() bool) {
 		return false, nil, nil
 	}
 	return true, markMux.mux.Unlock, markMux.checkTouchedAndReset
+}
+
+func addressContains(workloadEntries []*istioNetworkingV1.WorkloadEntry, targetWorkloadEntry *istioNetworkingV1.WorkloadEntry) bool {
+	for _, workloadEntry := range workloadEntries {
+		if workloadEntry.Address == targetWorkloadEntry.Address {
+			return true
+		}
+	}
+	return false
+}
+
+func oneSideDiff(dst, a, b []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
+	for _, workloadEntry := range a {
+		if !addressContains(b, workloadEntry) {
+			dst = append(dst, workloadEntry)
+		}
+	}
+	return dst
+}
+
+func diff(dst, desired, actual []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
+	// Find elements in actual that are not in desired (removals)
+	dst = oneSideDiff(dst, actual, desired)
+	// Find elements in desired that are not in actual (additions)
+	dst = oneSideDiff(dst, desired, actual)
+	return dst
 }
 
 func handleEndpointUpdate(
@@ -243,7 +285,7 @@ func handleEndpointUpdate(
 	//	logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
 	//	return nil, err // No changes, no need to update.
 	//}
-	workloadEntriesDiff := helpers.Diff(nil, newWorkloadEntries, serviceEntry.Spec.Endpoints)
+	workloadEntriesDiff := diff(nil, newWorkloadEntries, serviceEntry.Spec.Endpoints)
 	//logger.Info("Detected endpoint changes", "ServiceEntry", serviceEntry.Name)
 
 	if len(workloadEntriesDiff) == 0 {

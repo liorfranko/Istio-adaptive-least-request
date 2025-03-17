@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,7 +19,6 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,7 +31,6 @@ import (
 	clientPkg "sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "istio-adaptive-least-request/api/v1alpha1"
-	"istio-adaptive-least-request/internal/helpers"
 	"istio-adaptive-least-request/internal/metrics"
 )
 
@@ -66,10 +63,7 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 
 func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(0).Info("Reconcile IstioAdaptiveRequestOptimizer",
-		"IstioAdaptiveRequestOptimizer.Namespace", req.Namespace,
-		"IstioAdaptiveRequestOptimizer.Name", req.Name,
-	)
+	logger.Info("Starting reconcile IstioAdaptiveRequestOptimizer")
 	var opt api.IstioAdaptiveRequestOptimizer
 	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
 		logger.Info("IstioAdaptiveRequestOptimizer not found",
@@ -131,30 +125,19 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			)
 			return ctrl.Result{RequeueAfter: r.RequeueAfter * time.Second}, nil
 		}
-		var podList corev1.PodList
-		listOpts := client.ListOptions{
-			Namespace: opt.Namespace,
-			LabelSelector: labels.SelectorFromSet(labels.Set{
-				"service.istio.io/canonical-name": opt.Spec.ServiceName,
-			}),
-		}
-		if err := r.Client.List(ctx, &podList, &listOpts); err != nil {
-			return ctrl.Result{}, err
-		}
-		podsInfo := addPods(logger, podList.Items, nil)
 		getPodMetricsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		podAddressToPodMetrics, err := getPodMetrics(
 			getPodMetricsCtx,
 			logger,
-			opt.Name,
 			opt.Namespace,
-			podsInfo,
+			&serviceEntry,
 			r.QueryInterval,
 			r.VmdbUrl,
 			r.StepInterval,
 		)
 		if err != nil {
+			logger.Error(err, "Failed to get pod metrics")
 			// If there is a problem with pulling the metrics from VictoriaMetrics, log an error and continue to the next port
 			metrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName,
 				"type":      "get_metrics_from_vm",
@@ -171,7 +154,6 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			}
 			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 		}
-		enrichPodMetrics(logger, podAddressToPodMetrics)
 		distributeWeightsBasedOnCPU(
 			logger,
 			podAddressToPodMetrics,
@@ -180,10 +162,12 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			r.ScaledownFactor,
 			r.MinimumWeight,
 		)
+		logger.Info("Trying to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		if err := r.Update(ctx, &serviceEntry); err != nil {
 			logger.Error(err, "Failed to validate or update weights.")
 			return ctrl.Result{}, err
 		}
+		logger.Info("Successfully updated ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		updateMetrics(&serviceEntry)
 	}
 	status := &opt.Status
@@ -206,62 +190,53 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 
 type tVmDBItem struct {
 	Metric struct {
-		Pod string `json:"pod"`
+		PodAddress string `json:"pod_ip"`
 	} `json:"metric"`
-	Value []json.RawMessage `json:"value"`
-}
-
-type tPodMetrics struct {
-	podName    string
-	podAddress string
-	cpuTime    float64
-}
-
-type tPodInfo struct {
-	address string
-	name    string
+	Value []any `json:"value"`
 }
 
 // getVMQueryMetric queries VictoriaMetrics for the given service and protocol and returns the response.
 func getPodMetrics(
 	ctx context.Context,
 	logger logr.Logger,
-	service string,
 	namespace string,
-	podsInfo []tPodInfo,
+	serviceEntry *istioClientV1.ServiceEntry,
 	queryInterval string,
 	vmDbUrl string,
 	stepInterval string,
-) (map[string]*tPodMetrics, error) {
-	cpuMetrics, err := getCPUMetrics(ctx, logger, service, namespace, queryInterval, vmDbUrl, stepInterval)
+) (map[string]float64, error) {
+	unfilteredPodAddressToCPUTime, err := getCPUMetrics(
+		ctx,
+		logger,
+		serviceEntry.Name,
+		namespace,
+		queryInterval,
+		vmDbUrl,
+		stepInterval,
+	)
 	if err != nil {
 		return nil, err
 	}
-	logger.V(1).Info("cpuMetrics", "cpuMetrics", cpuMetrics)
-	if len(cpuMetrics) == 0 {
-		return nil, fmt.Errorf("no results when getting cpu usage for service %s", service)
+	endpoints := serviceEntry.Spec.Endpoints
+	podAddressToCPUTime := make(map[string]float64, len(endpoints))
+	cpuTimesSum := 0.0
+	cpuTimeLen := 0
+	for _, workloadEntry := range endpoints {
+		address := workloadEntry.Address
+		cpuTime, ok := unfilteredPodAddressToCPUTime[address]
+		if ok && cpuTime > 0.0 {
+			cpuTimesSum += cpuTime
+			cpuTimeLen++
+		}
+		podAddressToCPUTime[address] = cpuTime
 	}
-	podAddressToPodMetrics := make(map[string]*tPodInfo)
-	for i := range podsInfo {
-		podInfo := &podsInfo[i]
-		podAddressToPodMetrics[podInfo.name] = podInfo
-	}
-	podMetricsMap := map[string]*tPodMetrics{}
-	for podName, podInfo := range podAddressToPodMetrics {
-		if cpuMetric, exists := cpuMetrics[podName]; exists {
-			address := podInfo.address
-			podMetricsMap[address] = &tPodMetrics{
-				podName:    podName,
-				podAddress: address,
-				cpuTime:    cpuMetric,
-			}
-			logger.V(1).Info("Updated pod with CPU metrics",
-				"podName", podName,
-				"cpuTime", cpuMetric,
-			)
+	avgCPU := cpuTimesSum / float64(cpuTimeLen)
+	for address, cpuTime := range podAddressToCPUTime {
+		if cpuTime == 0.0 {
+			podAddressToCPUTime[address] = avgCPU
 		}
 	}
-	return podMetricsMap, nil
+	return podAddressToCPUTime, nil
 }
 
 func getCPUMetrics(
@@ -273,15 +248,14 @@ func getCPUMetrics(
 	vmDbUrl string,
 	stepInterval string,
 ) (map[string]float64, error) {
-	logger.Info("Querying CPU from VictoriaMetrics for service",
-		"service.name", service,
-		"service.namespace", namespace,
-	)
+	logger.Info("Querying CPU from VictoriaMetrics for service")
 	query := fmt.Sprintf(
-		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s])) by (pod)`,
+		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) (kube_pod_info{namespace="%s", pod=~"%s.*"})) by (pod_ip)`,
 		namespace,
 		service,
 		queryInterval,
+		namespace,
+		service,
 	)
 	logger.V(1).Info("query", "query", query)
 	// Start timer
@@ -297,17 +271,20 @@ func getCPUMetrics(
 		"service_namespace": namespace,
 	}
 	metrics.QueryLatencyMetric.With(queryLabels).Set(elapsedTime)
-	podCPUMetrics := make(map[string]float64)
-	for _, v := range cpuTimes {
-		cpuTimeBytes := bytes.Trim(v.Value[1], `"`)
-		cpuTime, err := strconv.ParseFloat((string)(cpuTimeBytes), 64)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing ResponseTime for pod %v: %w", v.Metric.Pod, err)
+	podAddressToCPUTime := make(map[string]float64)
+	for i := range cpuTimes {
+		v := &cpuTimes[i]
+		if len(v.Value) < 2 {
+			return nil, fmt.Errorf("error parsing ResponseTime for pod %v: %w", v.Metric.PodAddress, err)
 		}
-		podName := v.Metric.Pod
-		podCPUMetrics[podName] = cpuTime
+		cpuTime, err := strconv.ParseFloat(v.Value[1].(string), 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing ResponseTime for pod %v: %w", v.Metric.PodAddress, err)
+		}
+		podAddress := v.Metric.PodAddress
+		podAddressToCPUTime[podAddress] = cpuTime
 	}
-	return podCPUMetrics, nil
+	return podAddressToCPUTime, nil
 }
 
 func closeDeferred(logger logr.Logger, closer io.Closer) {
@@ -349,51 +326,6 @@ func getVMCPUQueryMetric(
 	}
 	logger.V(1).Info("Response from VictoriaMetrics", "vmDBRes", vmDBRes)
 	return vmDBRes.Data.Result, nil
-}
-
-func addPods(logger logr.Logger, pods []corev1.Pod, podsInfo []tPodInfo) []tPodInfo {
-	for i := range pods {
-		pod := &pods[i]
-		// Skip pods that are being deleted
-		if !pod.DeletionTimestamp.IsZero() {
-			logger.V(1).Info("Skipping pod: marked for deletion", "podName", pod.Name)
-			continue
-		}
-		// Check if pod is ready
-		isReady := false
-		for _, condition := range pod.Status.Conditions {
-			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
-				isReady = true
-				break
-			}
-		}
-		if !isReady {
-			logger.V(1).Info("Skipping pod: not ready",
-				"podName", pod.Name,
-			)
-			continue
-		}
-		address := pod.Status.PodIP
-		if address == "" {
-			logger.V(1).Info("Skipping pod: no IP address",
-				"podName", pod.Name,
-			)
-			continue
-		}
-		podsInfo = append(podsInfo, tPodInfo{
-			address: address,
-			name:    pod.Name,
-		})
-		logger.V(1).Info("Added pod to list",
-			"podName", pod.Name,
-			"podIP", address,
-		)
-	}
-	logger.Info("Finished listing pods",
-		"totalPods", len(pods),
-		"readyPods", len(podsInfo),
-	)
-	return podsInfo
 }
 
 func fallbackStrategy(
@@ -446,33 +378,9 @@ func resetWeights(
 	return nil
 }
 
-func enrichPodMetrics(logger logr.Logger, podsMetrics map[string]*tPodMetrics) {
-	if len(podsMetrics) == 0 {
-		return
-	}
-	var cpuTimes []float64
-	for _, cpuMetric := range podsMetrics {
-		if cpuMetric.cpuTime != 0.0 {
-			cpuTimes = append(cpuTimes, cpuMetric.cpuTime)
-		}
-	}
-	averageCPU, _ := stats.Mean(cpuTimes)
-	standardDeviationCPU, _ := stats.StdDevP(cpuTimes)
-	logger.V(4).Info("averageCPU", "averageCPU", averageCPU)
-	logger.V(4).Info("standardDeviationCPU", "standardDeviationCPU", standardDeviationCPU)
-	for _, ep := range podsMetrics {
-		if ep.cpuTime == 0.0 {
-			// Pods without CPU metrics will have the averageCPU, and are not optimized
-			ep.cpuTime = averageCPU
-		}
-		cpuDistance := ep.cpuTime - averageCPU
-		logger.V(4).Info("CPU Distance", "CPU Distance", cpuDistance)
-	}
-}
-
 func distributeWeightsBasedOnCPU(
 	logger logr.Logger,
-	podMetricsMap map[string]*tPodMetrics,
+	podAddressToCPUTime map[string]float64,
 	serviceEntry *istionetworkingv1.ServiceEntry,
 	scaleupFactor float64,
 	scaledownFactor float64,
@@ -484,17 +392,18 @@ func distributeWeightsBasedOnCPU(
 		podAddressToWorkloadEntry[workloadEntry.Address] = workloadEntry
 		podAddressToLocality[workloadEntry.Address] = workloadEntry.Locality
 	}
-
-	groups := make(map[string][]*tPodMetrics, len(podMetricsMap))
+	type tPodCPUTime struct {
+		address string
+		cpuTime float64
+	}
+	groups := make(map[string][]tPodCPUTime, len(podAddressToCPUTime))
 	for address := range podAddressToWorkloadEntry {
 		locality := podAddressToLocality[address]
-		podMetric, ok := podMetricsMap[address]
-		if !ok {
-			podMetric = &tPodMetrics{
-				podAddress: address,
-			}
-		}
-		groups[locality] = append(groups[locality], podMetric)
+		cpuTime := podAddressToCPUTime[address]
+		groups[locality] = append(groups[locality], tPodCPUTime{
+			address: address,
+			cpuTime: cpuTime,
+		})
 	}
 
 	// Process each locality group
@@ -503,29 +412,35 @@ func distributeWeightsBasedOnCPU(
 
 		// Calculate group total weight
 		var groupTotalWeight float64
-		for _, pm := range groupPods {
-			groupTotalWeight += float64(podAddressToWorkloadEntry[pm.podAddress].Weight)
+		for i := range groupPods {
+			podCPUTime := &groupPods[i]
+			address := podCPUTime.address
+			groupTotalWeight += float64(podAddressToWorkloadEntry[address].Weight)
 		}
 
 		// Check if group total weight is below minimum threshold
 		minGroupTotal := float64(len(groupPods)) * 200.0
 		if groupTotalWeight < minGroupTotal {
 			for _, pm := range groupPods {
-				podAddressToWorkloadEntry[pm.podAddress].Weight *= 5
+				podAddressToWorkloadEntry[pm.address].Weight *= 5
 			}
 			continue
 		}
 
 		// Calculate average CPU for the group
 		var cpuTimes []float64
-		for _, pm := range groupPods {
-			cpuTimes = append(cpuTimes, pm.cpuTime)
+		for i := range groupPods {
+			podCPUTime := &groupPods[i]
+			cpuTime := podCPUTime.cpuTime
+			cpuTimes = append(cpuTimes, cpuTime)
 		}
 		avgCPU, _ := stats.Mean(cpuTimes)
 		if avgCPU < 0.20 {
 			// Set all to maximum if insufficient data
-			for _, pm := range groupPods {
-				podAddressToWorkloadEntry[pm.podAddress].Weight = 1000
+			for i := range groupPods {
+				podCPUTime := &groupPods[i]
+				address := podCPUTime.address
+				podAddressToWorkloadEntry[address].Weight = 1000
 			}
 			continue
 		}
@@ -533,21 +448,20 @@ func distributeWeightsBasedOnCPU(
 		var xSum float64
 		for _, pm := range groupPods {
 			if pm.cpuTime > 0 {
-				xSum += avgCPU / pm.cpuTime * float64(podAddressToWorkloadEntry[pm.podAddress].Weight)
+				xSum += avgCPU / pm.cpuTime * float64(podAddressToWorkloadEntry[pm.address].Weight)
 			}
 		}
 
 		// Adjust weights for each pod in the group
 		avgGroupWeight := groupTotalWeight / float64(len(groupPods))
 		for _, pm := range groupPods {
-			currentWeight := float64(podAddressToWorkloadEntry[pm.podAddress].Weight)
+			currentWeight := float64(podAddressToWorkloadEntry[pm.address].Weight)
 			if currentWeight == 0 {
 				// TODO: its hack we need change the iteration to be based on the serviceEntryWeightsMap in next version.
 				logger.Info("Weight is 0, skipping",
-					"podAddress", pm.podAddress,
-					"podName", pm.podName,
+					"address", pm.address,
 				)
-				podAddressToWorkloadEntry[pm.podAddress].Weight = uint32(minimumWeight)
+				podAddressToWorkloadEntry[pm.address].Weight = uint32(minimumWeight)
 				continue
 			}
 			newShare := (avgCPU / pm.cpuTime) * (currentWeight / xSum) * groupTotalWeight
@@ -567,10 +481,9 @@ func distributeWeightsBasedOnCPU(
 			}
 			if adjustedWeight < float64(minimumWeight) {
 				logger.Info("Adjusted weight is less than minimumWeight, setting it to minimumWeight Weight optimization",
-					"podAddress", pm.podAddress,
-					"podName", pm.podName,
+					"address", pm.address,
 					"cpuTime", pm.cpuTime,
-					"Weight", podAddressToWorkloadEntry[pm.podAddress].Weight,
+					"Weight", podAddressToWorkloadEntry[pm.address].Weight,
 					"NewShare", newShare,
 					"AdjustedWeight", adjustedWeight,
 					"Distance", distance,
@@ -586,17 +499,17 @@ func distributeWeightsBasedOnCPU(
 				adjustedWeight = float64(minimumWeight)
 			}
 
-			podAddressToWorkloadEntry[pm.podAddress].Weight = uint32(adjustedWeight)
+			podAddressToWorkloadEntry[pm.address].Weight = uint32(adjustedWeight)
 		}
 		// Normalize weights to keep the average weight equal to 1000
 		var totalWeight float64
 		for _, podMetrics := range groupPods {
-			totalWeight += float64(podAddressToWorkloadEntry[podMetrics.podAddress].Weight)
+			totalWeight += float64(podAddressToWorkloadEntry[podMetrics.address].Weight)
 		}
 		normalizationFactor := (1000 * float64(len(groupPods))) / totalWeight
 		for _, podMetrics := range groupPods {
-			weight := uint32(float64(podAddressToWorkloadEntry[podMetrics.podAddress].Weight) * normalizationFactor)
-			podAddressToWorkloadEntry[podMetrics.podAddress].Weight = weight
+			weight := uint32(float64(podAddressToWorkloadEntry[podMetrics.address].Weight) * normalizationFactor)
+			podAddressToWorkloadEntry[podMetrics.address].Weight = weight
 		}
 
 	}
@@ -680,6 +593,14 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) initServiceEntry(
 	)
 }
 
+// It returns the dereference string if it's not nil, or a default value (e.g., "TCP") if it's nil.
+func safeDereferenceAppProtocol(appProtocolPtr *string) string {
+	if appProtocolPtr != nil {
+		return *appProtocolPtr
+	}
+	return "TCP"
+}
+
 func appendCoreServicePortsToIstioServicePorts(
 	istioServicePorts []*istioNetworkingV1.ServicePort,
 	coreServicePorts []corev1.ServicePort,
@@ -688,7 +609,7 @@ func appendCoreServicePortsToIstioServicePorts(
 		port := &coreServicePorts[i]
 		istioServicePort := &istioNetworkingV1.ServicePort{
 			Number:     uint32(port.Port),
-			Protocol:   helpers.SafeDereferenceAppProtocol(port.AppProtocol),
+			Protocol:   safeDereferenceAppProtocol(port.AppProtocol),
 			Name:       port.Name,
 			TargetPort: uint32(port.TargetPort.IntValue()),
 		}
@@ -697,10 +618,19 @@ func appendCoreServicePortsToIstioServicePorts(
 	return istioServicePorts
 }
 
+func namespaceInFilteredList(namespace string, filteredNamespaces []string) bool {
+	for _, ns := range filteredNamespaces {
+		if namespace == ns {
+			return true
+		}
+	}
+	return false
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *IstioAdaptiveRequestOptimizerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	namespacePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return helpers.NamespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
+		return namespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
 	})
 	ignoreStatusUpdatesPredicate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
