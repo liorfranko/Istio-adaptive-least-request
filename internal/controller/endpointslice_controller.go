@@ -2,14 +2,13 @@ package controller
 
 import (
 	"context"
-	"github.com/prometheus/client_golang/prometheus"
-	"istio-adaptive-least-request/internal/metrics"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	api "istio-adaptive-least-request/api/v1alpha1"
+	"istio-adaptive-least-request/internal/metrics"
 )
 
 // EndpointSliceReconciler reconciles an EndpointSlice object
@@ -88,26 +88,14 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}, nil
 }
 
-func cleanupPodMetrics(serviceNamespace, serviceName, podIP, locality string) int {
-	// Define Prometheus metrics to be removed
-	removedMetrics := 0
-	metricsToRemove := []*prometheus.GaugeVec{
-		metrics.WeightMetric,
-	}
-	for _, metricVec := range metricsToRemove {
-		if !metricVec.Delete(prometheus.Labels{"service_namespace": serviceNamespace, "service_name": serviceName, "pod_ip": podIP, "locality": locality}) {
-			continue
-		}
-		removedMetrics++
-	}
-	return removedMetrics
-}
-
 func cleanupPodMetricsFromWorkloadEntries(oldWorkloadEntries []*istioNetworkingV1.WorkloadEntry, serviceEntryNamespace, serviceEntryName string) {
 	for _, workloadEntry := range oldWorkloadEntries {
 		podAddress := workloadEntry.Address
-		podZone := getLocalityForMetric(workloadEntry.Locality)
-		cleanupPodMetrics(serviceEntryNamespace, serviceEntryName, podAddress, podZone)
+		metrics.WeightMetric.Delete(prometheus.Labels{
+			"service_namespace": serviceEntryNamespace,
+			"service_name":      serviceEntryName,
+			"pod_ip":            podAddress,
+		})
 	}
 }
 
