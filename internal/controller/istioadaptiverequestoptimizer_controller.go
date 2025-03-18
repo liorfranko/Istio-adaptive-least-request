@@ -515,7 +515,6 @@ func distributeWeightsBasedOnCPU(
 		normalizationFactor := (1000 * float64(len(groupPods))) / totalWeight
 		for _, podMetrics := range groupPods {
 			weight := uint32(float64(podAddressToWorkloadEntry[podMetrics.address].Weight) * normalizationFactor)
-
 			podAddressToWorkloadEntry[podMetrics.address].Weight = weight
 		}
 	}
