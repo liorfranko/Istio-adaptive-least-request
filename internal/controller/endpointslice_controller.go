@@ -7,11 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/prometheus/client_golang/prometheus"
-
-	"istio-adaptive-least-request/internal/metrics"
-
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	api "istio-adaptive-least-request/api/v1alpha1"
+	"istio-adaptive-least-request/internal/metrics"
 )
 
 // EndpointSliceReconciler reconciles an EndpointSlice object
