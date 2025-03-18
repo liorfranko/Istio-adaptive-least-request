@@ -7,7 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	istioNetworkingV1 "istio.io/api/networking/v1"
