@@ -12,7 +12,7 @@ var (
 			Name: "endpoint_weight",
 			Help: "Weight of a service entry endpoint.",
 		},
-		[]string{"service_namespace", "service_name", "pod_ip", "locality"}, // Label by pod name, IP, service name, and namespace
+		[]string{"service_namespace", "service_name", "pod_ip"}, // Label by pod name, IP, service name, and namespace
 	)
 	// ErrorMetrics tracks various error occurrences within the reconciler
 	ErrorMetrics = prometheus.NewCounterVec(
