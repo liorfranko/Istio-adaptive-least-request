@@ -11,7 +11,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
-	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -285,16 +284,6 @@ func handleEndpointUpdate(
 			newWorkloadEntries = append(newWorkloadEntries, newWorkloadEntry)
 		}
 	}
-	var coreService corev1.Service
-	objectKey := client.ObjectKey{
-		Namespace: serviceEntry.Namespace,
-		Name:      serviceEntry.Name,
-	}
-	if err := c.Get(ctx, objectKey, &coreService); err != nil {
-		logger.Error(err, "Failed to fetch Service.")
-		return nil, checkTouchedAndReset(), err
-	}
-	serviceEntry.Spec.Ports = appendCoreServicePortsToIstioServicePorts(serviceEntry.Spec.Ports[:0], coreService.Spec.Ports)
 	workloadEntriesDiff := diff(nil, newWorkloadEntries, oldWorkloadEntries)
 	if !hasChanges(oldWorkloadEntries, newWorkloadEntries) {
 		logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
