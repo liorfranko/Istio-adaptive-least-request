@@ -393,6 +393,8 @@ func distributeWeightsBasedOnCPU(
 		podAddressToWorkloadEntry[workloadEntry.Address] = workloadEntry
 		if localityEnabled {
 			podAddressToLocality[workloadEntry.Address] = workloadEntry.Locality
+		} else {
+			workloadEntry.Locality = ""
 		}
 	}
 	type tPodCPUTime struct {
