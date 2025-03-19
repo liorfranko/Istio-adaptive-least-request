@@ -300,6 +300,7 @@ func handleEndpointUpdate(
 		logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
 		return nil, checkTouchedAndReset(), nil // No changes, no need to update.
 	}
+	serviceEntry.Spec.Endpoints = newWorkloadEntries
 	if err := c.Update(ctx, serviceEntry); err != nil {
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		return nil, checkTouchedAndReset(), err // Return the error to retry
