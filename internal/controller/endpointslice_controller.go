@@ -11,7 +11,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	istioNetworkingV1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
-	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -151,18 +150,13 @@ func tryLock(namespace, name string) (bool, func(), func() bool) {
 	return true, markMux.mux.Unlock, markMux.checkTouchedAndReset
 }
 
-func addressContains(workloadEntries []*istioNetworkingV1.WorkloadEntry, targetWorkloadEntry *istioNetworkingV1.WorkloadEntry) bool {
-	for _, workloadEntry := range workloadEntries {
-		if workloadEntry.Address == targetWorkloadEntry.Address {
-			return true
-		}
-	}
-	return false
+func eqAddress(a, b *istioNetworkingV1.WorkloadEntry) bool {
+	return a.Address == b.Address
 }
 
 func oneSideDiff(dst, a, b []*istioNetworkingV1.WorkloadEntry) []*istioNetworkingV1.WorkloadEntry {
 	for _, workloadEntry := range a {
-		if !addressContains(b, workloadEntry) {
+		if !contains(b, workloadEntry, eqAddress) {
 			dst = append(dst, workloadEntry)
 		}
 	}
@@ -175,6 +169,37 @@ func diff(dst, desired, actual []*istioNetworkingV1.WorkloadEntry) []*istioNetwo
 	// Find elements in desired that are not in actual (additions)
 	dst = oneSideDiff(dst, desired, actual)
 	return dst
+}
+
+func equalAddressAndLocality(a, b *istioNetworkingV1.WorkloadEntry) bool {
+	if a.Address != b.Address {
+		return false
+	}
+	if a.Locality != b.Locality {
+		return false
+	}
+	return true
+}
+
+func contains[T any](entries []T, targetEntry T, eqFn func(T, T) bool) bool {
+	for _, entry := range entries {
+		if eqFn(entry, targetEntry) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasChanges(old, new []*istioNetworkingV1.WorkloadEntry) bool {
+	if len(old) != len(new) {
+		return true
+	}
+	for _, newEntry := range new {
+		if !contains(old, newEntry, equalAddressAndLocality) {
+			return true
+		}
+	}
+	return false
 }
 
 func handleEndpointUpdate(
@@ -208,9 +233,10 @@ func handleEndpointUpdate(
 		)
 		return nil, checkTouchedAndReset(), nil // No endpoints to process
 	}
-	addressToWorkloadEntry := make(map[string]*istioNetworkingV1.WorkloadEntry)
-	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
-		addressToWorkloadEntry[workloadEntry.Address] = workloadEntry
+	addressToWeight := make(map[string]uint32)
+	oldWorkloadEntries := serviceEntry.Spec.Endpoints
+	for _, oldWorkloadEntry := range oldWorkloadEntries {
+		addressToWeight[oldWorkloadEntry.Address] = oldWorkloadEntry.Weight
 	}
 	existAddresses := make(map[string]struct{})
 	newWorkloadEntries := make([]*istioNetworkingV1.WorkloadEntry, 0)
@@ -239,55 +265,37 @@ func handleEndpointUpdate(
 				continue
 			}
 			existAddresses[address] = struct{}{}
-			workloadEntry, ok := addressToWorkloadEntry[address]
+			weight, ok := addressToWeight[address]
 			if !ok {
-				workloadEntry = &istioNetworkingV1.WorkloadEntry{
-					Address: address,
-					Weight:  initialWeight,
-				}
+				weight = initialWeight
 			}
 			var locality string
 			if localityEnabled {
 				if zonePtr := endpoint.Zone; zonePtr != nil {
 					locality = *zonePtr
-					workloadEntry.Locality = locality[:len(locality)-1] + "/" + locality
+					locality = locality[:len(locality)-1] + "/" + locality
 				}
 			}
-			newWorkloadEntries = append(newWorkloadEntries, workloadEntry)
+			newWorkloadEntry := &istioNetworkingV1.WorkloadEntry{
+				Address:  address,
+				Weight:   weight,
+				Locality: locality,
+			}
+			newWorkloadEntries = append(newWorkloadEntries, newWorkloadEntry)
 		}
 	}
-
-	var coreService corev1.Service
-	objectKey := client.ObjectKey{
-		Namespace: serviceEntry.Namespace,
-		Name:      serviceEntry.Name,
-	}
-	if err := c.Get(ctx, objectKey, &coreService); err != nil {
-		logger.Error(err, "Failed to fetch Service.")
-		return nil, checkTouchedAndReset(), err
-	}
-	serviceEntry.Spec.Ports = appendCoreServicePortsToIstioServicePorts(serviceEntry.Spec.Ports[:0], coreService.Spec.Ports)
-
-	// Check if updates are required based on endpoint changes.
-	//if !(addressesChanged(serviceEntry.Spec.Endpoints, newWorkloadEntries) || checkPortsChanged(serviceEntry.Spec.Ports, service.Spec.ServicePorts)) {
-	//	logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
-	//	return nil, err // No changes, no need to update.
-	//}
-	workloadEntriesDiff := diff(nil, newWorkloadEntries, serviceEntry.Spec.Endpoints)
-	//logger.Info("Detected endpoint changes", "ServiceEntry", serviceEntry.Name)
-
-	if len(workloadEntriesDiff) == 0 {
+	workloadEntriesDiff := diff(nil, newWorkloadEntries, oldWorkloadEntries)
+	if !hasChanges(oldWorkloadEntries, newWorkloadEntries) {
 		logger.Info("No changes detected", "ServiceEntry", serviceEntry.Name)
 		return nil, checkTouchedAndReset(), nil // No changes, no need to update.
 	}
-	// Update the ServiceEntry with the newly merged endpoints.
 	serviceEntry.Spec.Endpoints = newWorkloadEntries
 	if err := c.Update(ctx, serviceEntry); err != nil {
 		logger.Error(err, "Failed to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		return nil, checkTouchedAndReset(), err // Return the error to retry
 	}
 	updateMetrics(serviceEntry)
-	logger.Info("ServiceEntry updated handleEndpointUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", serviceEntry.Spec.Endpoints)
+	logger.Info("ServiceEntry updated handleEndpointUpdate with new weights", "ServiceEntry", serviceEntry.Name, "ServiceEntry.Spec.Endpoints", newWorkloadEntries)
 	return workloadEntriesDiff, checkTouchedAndReset(), nil
 }
 

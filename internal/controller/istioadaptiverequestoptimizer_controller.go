@@ -14,7 +14,9 @@ import (
 	"github.com/montanaflynn/stats"
 	"github.com/prometheus/client_golang/prometheus"
 	istioNetworkingV1 "istio.io/api/networking/v1"
+	istioapinetworkingv1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
+	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -22,13 +24,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	clientPkg "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-
-	istioapinetworkingv1 "istio.io/api/networking/v1"
-	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
-	clientPkg "sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/metrics"
@@ -158,6 +157,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			logger,
 			podAddressToPodMetrics,
 			&serviceEntry,
+			opt.Spec.LocalityEnabled,
 			r.ScaleupFactor,
 			r.ScaledownFactor,
 			r.MinimumWeight,
@@ -382,6 +382,7 @@ func distributeWeightsBasedOnCPU(
 	logger logr.Logger,
 	podAddressToCPUTime map[string]float64,
 	serviceEntry *istionetworkingv1.ServiceEntry,
+	localityEnabled bool,
 	scaleupFactor float64,
 	scaledownFactor float64,
 	minimumWeight int,
@@ -390,7 +391,11 @@ func distributeWeightsBasedOnCPU(
 	podAddressToLocality := make(map[string]string)
 	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
 		podAddressToWorkloadEntry[workloadEntry.Address] = workloadEntry
-		podAddressToLocality[workloadEntry.Address] = workloadEntry.Locality
+		if localityEnabled {
+			podAddressToLocality[workloadEntry.Address] = workloadEntry.Locality
+		} else {
+			workloadEntry.Locality = ""
+		}
 	}
 	type tPodCPUTime struct {
 		address string
@@ -398,7 +403,10 @@ func distributeWeightsBasedOnCPU(
 	}
 	groups := make(map[string][]tPodCPUTime, len(podAddressToCPUTime))
 	for address := range podAddressToWorkloadEntry {
-		locality := podAddressToLocality[address]
+		locality := ""
+		if localityEnabled {
+			locality = podAddressToLocality[address]
+		}
 		cpuTime := podAddressToCPUTime[address]
 		groups[locality] = append(groups[locality], tPodCPUTime{
 			address: address,
@@ -511,7 +519,6 @@ func distributeWeightsBasedOnCPU(
 			weight := uint32(float64(podAddressToWorkloadEntry[podMetrics.address].Weight) * normalizationFactor)
 			podAddressToWorkloadEntry[podMetrics.address].Weight = weight
 		}
-
 	}
 }
 
