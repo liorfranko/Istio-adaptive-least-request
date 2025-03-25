@@ -217,6 +217,9 @@ func getPodMetrics(
 	if err != nil {
 		return nil, err
 	}
+	if len(unfilteredPodAddressToCPUTime) == 0 {
+		return nil, fmt.Errorf("empty metrics returned from VM DB")
+	}
 	endpoints := serviceEntry.Spec.Endpoints
 	podAddressToCPUTime := make(map[string]float64, len(endpoints))
 	cpuTimesSum := 0.0
