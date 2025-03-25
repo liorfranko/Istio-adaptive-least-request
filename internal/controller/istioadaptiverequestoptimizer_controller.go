@@ -143,7 +143,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 				"name":      opt.Name,
 				"namespace": opt.Namespace,
 			}).Inc()
-			if err := fallbackStrategy(ctx, logger, r.Client, &opt, &serviceEntry, uint32(r.MinimumWeight)); err != nil {
+			if err := fallbackStrategy(ctx, logger, r.Client, &opt, &serviceEntry, uint32(r.InitialWeight)); err != nil {
 				metrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName,
 					"type":      "fallback_strategy",
 					"name":      opt.Name,
@@ -342,6 +342,8 @@ func fallbackStrategy(
 	logger.Info("Initiating fallback strategy check")
 	if shouldSkipFallback(opt) {
 		logger.Info("Recent optimization detected; skipping fallback strategy")
+		// When the controller restart and have no metrics, we need to create the metrics in case there are no updates.
+		updateMetrics(serviceEntry)
 		return nil
 	}
 	if err := resetWeights(ctx, logger, client, serviceEntry, resetWeight); err != nil {
