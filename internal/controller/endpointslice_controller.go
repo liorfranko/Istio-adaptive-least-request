@@ -67,6 +67,9 @@ func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger.Info("IstioAdaptiveRequestOptimizer not found. No weight adjustments made.")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if !opt.GetDeletionTimestamp().IsZero() {
+		return ctrl.Result{}, nil
+	}
 	logger.Info("Starting Reconcile EndpointSlice")
 	oldWorkloads, requeue, err := handleEndpointUpdate(
 		ctx,
