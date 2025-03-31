@@ -122,7 +122,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			logger.Info("ServiceEntry doesn't have any endpoints, continue",
 				"ServiceEntry", serviceEntry.Name,
 			)
-			return ctrl.Result{RequeueAfter: r.RequeueAfter * time.Second}, nil
+			return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
 		}
 		getPodMetricsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
@@ -151,7 +151,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 				}).Inc()
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
 		}
 		distributeWeightsBasedOnCPU(
 			logger,
@@ -185,7 +185,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 		return ctrl.Result{}, err
 	}
 	// Requeue reconciliation every 60 seconds to track new EndpointSlices.
-	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
 }
 
 type tVmDBItem struct {
