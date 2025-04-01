@@ -1,5 +1,8 @@
 package controller
 
+// To allow Leader Election, the controller must have RBAC permissions to create and manage leases.
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+
 import (
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 
