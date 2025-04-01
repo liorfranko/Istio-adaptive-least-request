@@ -448,12 +448,16 @@ func distributeWeightsBasedOnCPU(
 			cpuTimes = append(cpuTimes, cpuTime)
 		}
 		avgCPU, _ := stats.Mean(cpuTimes)
+		avgGroupWeight := groupTotalWeight / float64(len(groupPods))
+		if avgGroupWeight == 0 {
+			avgGroupWeight = 1000
+		}
 		if avgCPU < 0.20 {
 			// Set all to maximum if insufficient data
 			for i := range groupPods {
 				podCPUTime := &groupPods[i]
 				address := podCPUTime.address
-				podAddressToWorkloadEntry[address].Weight = 1000
+				podAddressToWorkloadEntry[address].Weight = uint32(avgGroupWeight)
 			}
 			continue
 		}
@@ -466,7 +470,6 @@ func distributeWeightsBasedOnCPU(
 		}
 
 		// Adjust weights for each pod in the group
-		avgGroupWeight := groupTotalWeight / float64(len(groupPods))
 		for _, pm := range groupPods {
 			currentWeight := float64(podAddressToWorkloadEntry[pm.address].Weight)
 			if currentWeight == 0 {
