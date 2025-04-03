@@ -220,6 +220,7 @@ func getPodMetrics(
 	if len(unfilteredPodAddressToCPUTime) == 0 {
 		return nil, fmt.Errorf("empty metrics returned from VM DB")
 	}
+
 	endpoints := serviceEntry.Spec.Endpoints
 	podAddressToCPUTime := make(map[string]float64, len(endpoints))
 	cpuTimesSum := 0.0
@@ -234,6 +235,11 @@ func getPodMetrics(
 		podAddressToCPUTime[address] = cpuTime
 	}
 	avgCPU := cpuTimesSum / float64(cpuTimeLen)
+	// if avgCpu is smaller than 0.2, we can set default weight to all the pods.
+	if avgCPU < 0.2 {
+		logger.Info("Average CPU is less than 0.2")
+		return nil, fmt.Errorf("average CPU is less than 0.2")
+	}
 	for address, cpuTime := range podAddressToCPUTime {
 		if cpuTime == 0.0 {
 			podAddressToCPUTime[address] = avgCPU
