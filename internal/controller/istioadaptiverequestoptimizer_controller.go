@@ -253,7 +253,7 @@ func getCPUMetrics(
 ) (map[string]float64, error) {
 	logger.Info("Querying CPU from VictoriaMetrics for service")
 	query := fmt.Sprintf(
-		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) (kube_pod_info{namespace="%s", pod=~"%s.*"})) by (pod_ip)`,
+		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) max_over_time(kube_pod_info{namespace="%s", pod=~"%s.*", pod_ip!=""}[1m])) by (pod_ip)`,
 		namespace,
 		service,
 		queryInterval,
