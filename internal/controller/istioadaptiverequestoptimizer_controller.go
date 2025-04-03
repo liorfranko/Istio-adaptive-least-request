@@ -235,9 +235,8 @@ func getPodMetrics(
 		podAddressToCPUTime[address] = cpuTime
 	}
 	avgCPU := cpuTimesSum / float64(cpuTimeLen)
-	// if avgCpu is smaller than 0.2, we can set default weight to all the pods.
+	// if avgCpu is smaller than 0.2, treat it like there is no data from VM DB
 	if avgCPU < 0.2 {
-		logger.Info("Average CPU is less than 0.2")
 		return nil, fmt.Errorf("average CPU is less than 0.2")
 	}
 	for address, cpuTime := range podAddressToCPUTime {
@@ -418,11 +417,13 @@ func distributeWeightsBasedOnCPU(
 		if localityEnabled {
 			locality = podAddressToLocality[address]
 		}
-		cpuTime := podAddressToCPUTime[address]
-		groups[locality] = append(groups[locality], tPodCPUTime{
-			address: address,
-			cpuTime: cpuTime,
-		})
+		cpuTime, ok := podAddressToCPUTime[address]
+		if ok {
+			groups[locality] = append(groups[locality], tPodCPUTime{
+				address: address,
+				cpuTime: cpuTime,
+			})
+		}
 	}
 
 	// Process each locality group
