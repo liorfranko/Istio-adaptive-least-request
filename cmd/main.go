@@ -184,6 +184,7 @@ func main() {
 		ScaleupFactor:   scaleupFactor,
 		ScaledownFactor: scaledownFactor,
 		MinimumWeight:   minimumWeight,
+		MaximumWeight:   maximumWeight,
 		InitialWeight:   initialWeight,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IstioAdaptiveRequestOptimizer")

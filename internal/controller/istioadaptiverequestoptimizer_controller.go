@@ -154,6 +154,8 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			}
 			return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
 		}
+		// log which metrics we got from the vm db
+		logger.Info("Pod metrics from VictoriaMetrics", "podAddressToPodMetrics", podAddressToPodMetrics)
 		distributeWeightsBasedOnCPU(
 			logger,
 			podAddressToPodMetrics,
