@@ -50,6 +50,7 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 	ScaledownFactor float64
 	MinimumWeight   int
 	InitialWeight   int
+	MaximumWeight   int
 }
 
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch;update;patch
@@ -161,6 +162,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			r.ScaleupFactor,
 			r.ScaledownFactor,
 			r.MinimumWeight,
+			r.MaximumWeight,
 		)
 		logger.Info("Trying to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		if err := r.Update(ctx, &serviceEntry); err != nil {
@@ -399,6 +401,7 @@ func distributeWeightsBasedOnCPU(
 	scaleupFactor float64,
 	scaledownFactor float64,
 	minimumWeight int,
+	maximumWeight int,
 ) {
 	podAddressToWorkloadEntry := make(map[string]*istioapinetworkingv1.WorkloadEntry)
 	podAddressToLocality := make(map[string]string)
@@ -521,6 +524,12 @@ func distributeWeightsBasedOnCPU(
 		normalizationFactor := (1000 * float64(len(groupPods))) / totalWeight
 		for _, podMetrics := range groupPods {
 			weight := uint32(float64(podAddressToWorkloadEntry[podMetrics.address].Weight) * normalizationFactor)
+			if weight > uint32(maximumWeight) {
+				weight = uint32(maximumWeight)
+			}
+			if weight < uint32(minimumWeight) {
+				weight = uint32(minimumWeight)
+			}
 			podAddressToWorkloadEntry[podMetrics.address].Weight = weight
 		}
 	}
