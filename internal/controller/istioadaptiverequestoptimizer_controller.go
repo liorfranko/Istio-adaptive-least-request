@@ -50,6 +50,7 @@ type IstioAdaptiveRequestOptimizerReconciler struct {
 	ScaledownFactor float64
 	MinimumWeight   int
 	InitialWeight   int
+	MaximumWeight   int
 }
 
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch;update;patch
@@ -153,6 +154,8 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			}
 			return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
 		}
+		// log which metrics we got from the vm db
+		logger.Info("Pod metrics from VictoriaMetrics", "podAddressToPodMetrics", podAddressToPodMetrics)
 		distributeWeightsBasedOnCPU(
 			logger,
 			podAddressToPodMetrics,
@@ -161,6 +164,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context,
 			r.ScaleupFactor,
 			r.ScaledownFactor,
 			r.MinimumWeight,
+			r.MaximumWeight,
 		)
 		logger.Info("Trying to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
 		if err := r.Update(ctx, &serviceEntry); err != nil {
@@ -220,6 +224,7 @@ func getPodMetrics(
 	if len(unfilteredPodAddressToCPUTime) == 0 {
 		return nil, fmt.Errorf("empty metrics returned from VM DB")
 	}
+
 	endpoints := serviceEntry.Spec.Endpoints
 	podAddressToCPUTime := make(map[string]float64, len(endpoints))
 	cpuTimesSum := 0.0
@@ -234,8 +239,14 @@ func getPodMetrics(
 		podAddressToCPUTime[address] = cpuTime
 	}
 	avgCPU := cpuTimesSum / float64(cpuTimeLen)
+	// if avgCpu is smaller than 0.2, treat it like there is no data from VM DB
+	if avgCPU < 0.2 {
+		return nil, fmt.Errorf("average CPU is less than 0.2")
+	}
 	for address, cpuTime := range podAddressToCPUTime {
 		if cpuTime == 0.0 {
+			// maybe we can remove this logic if the log not appear
+			logger.Info(fmt.Sprintf("Pod address %s has no CPU time", address))
 			podAddressToCPUTime[address] = avgCPU
 		}
 	}
@@ -253,13 +264,14 @@ func getCPUMetrics(
 ) (map[string]float64, error) {
 	logger.Info("Querying CPU from VictoriaMetrics for service")
 	query := fmt.Sprintf(
-		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) (kube_pod_info{namespace="%s", pod=~"%s.*"})) by (pod_ip)`,
+		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) first_over_time(kube_pod_info{namespace="%s", pod=~"%s.*", pod_ip!=""}[1m])) by (pod_ip)`,
 		namespace,
 		service,
 		queryInterval,
 		namespace,
 		service,
 	)
+
 	logger.V(1).Info("query", "query", query)
 	// Start timer
 	startTime := time.Now()
@@ -391,6 +403,7 @@ func distributeWeightsBasedOnCPU(
 	scaleupFactor float64,
 	scaledownFactor float64,
 	minimumWeight int,
+	maximumWeight int,
 ) {
 	podAddressToWorkloadEntry := make(map[string]*istioapinetworkingv1.WorkloadEntry)
 	podAddressToLocality := make(map[string]string)
@@ -412,11 +425,13 @@ func distributeWeightsBasedOnCPU(
 		if localityEnabled {
 			locality = podAddressToLocality[address]
 		}
-		cpuTime := podAddressToCPUTime[address]
-		groups[locality] = append(groups[locality], tPodCPUTime{
-			address: address,
-			cpuTime: cpuTime,
-		})
+		cpuTime, ok := podAddressToCPUTime[address]
+		if ok {
+			groups[locality] = append(groups[locality], tPodCPUTime{
+				address: address,
+				cpuTime: cpuTime,
+			})
+		}
 	}
 
 	// Process each locality group
@@ -448,19 +463,6 @@ func distributeWeightsBasedOnCPU(
 			cpuTimes = append(cpuTimes, cpuTime)
 		}
 		avgCPU, _ := stats.Mean(cpuTimes)
-		avgGroupWeight := groupTotalWeight / float64(len(groupPods))
-		if avgGroupWeight == 0 {
-			avgGroupWeight = 1000
-		}
-		if avgCPU < 0.20 {
-			// Set all to maximum if insufficient data
-			for i := range groupPods {
-				podCPUTime := &groupPods[i]
-				address := podCPUTime.address
-				podAddressToWorkloadEntry[address].Weight = uint32(avgGroupWeight)
-			}
-			continue
-		}
 		// Calculate X_sum for the "cake" formula
 		var xSum float64
 		for _, pm := range groupPods {
@@ -508,7 +510,6 @@ func distributeWeightsBasedOnCPU(
 					"xSum", xSum,
 					"scaleupFactor", scaleupFactor,
 					"scaledownFactor", scaledownFactor,
-					"avgGroupWeight", avgGroupWeight,
 					"currentWeight", currentWeight,
 					"minimumWeight", minimumWeight,
 				)
@@ -525,6 +526,12 @@ func distributeWeightsBasedOnCPU(
 		normalizationFactor := (1000 * float64(len(groupPods))) / totalWeight
 		for _, podMetrics := range groupPods {
 			weight := uint32(float64(podAddressToWorkloadEntry[podMetrics.address].Weight) * normalizationFactor)
+			if weight > uint32(maximumWeight) {
+				weight = uint32(maximumWeight)
+			}
+			if weight < uint32(minimumWeight) {
+				weight = uint32(minimumWeight)
+			}
 			podAddressToWorkloadEntry[podMetrics.address].Weight = weight
 		}
 	}
@@ -557,6 +564,7 @@ func (r *IstioAdaptiveRequestOptimizerReconciler) initServiceEntry(
 			}
 			if address == "" {
 				// TODO(romang): check why this happens, if it is
+				logger.Info("Endpoint has no address", "Endpoint", endpoint)
 				continue
 			}
 			if _, ok := existAddresses[address]; ok {
