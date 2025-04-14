@@ -23,12 +23,11 @@ import (
 	"strings"
 	"time"
 
-	"sigs.k8s.io/controller-runtime/pkg/event"
-
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -40,7 +39,6 @@ import (
 
 	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
 	"istio-adaptive-least-request/internal/controller"
-	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -65,17 +63,15 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
-	var endpointsAnnotationKey, endpointPodScrapeAnnotationKey string
-	var serviceEntryLabelKey, serviceEntryServiceNameLabelKey string
 	var namespaces string
 	var vmdbUrl string
 	var optimizeCycleTime int
-	var minimumWeight, maximumWeight int
+	var minimumWeight, initialWeight, maximumWeight int
 	var queryInterval, stepInterval string
-	var minOptimizeCpuDistancePercent, cpuDistanceMultiplierPercent float64
-	var newEndpointsPercentileWeight int
+	var scaleupFactor float64
+	var scaledownFactor float64
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. "+
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to. "+
 		"Use the port :8080. If not set, it will be 0 in order to disable the metrics server")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -85,43 +81,33 @@ func main() {
 		"If set the metrics endpoint is served securely")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.StringVar(&endpointsAnnotationKey, "endpoints-annotation", "istio.adaptive.request.optimizer/optimize", "The annotation to use for setting that the endpoints object is optimized")
-	flag.StringVar(&endpointPodScrapeAnnotationKey, "endpoint-pod-scrape-annotation", "istio.adaptive.request.optimizer/scrape", "The annotation to use for setting that the endpoints object is to be scraped")
-	flag.StringVar(&serviceEntryLabelKey, "serviceentry-label", "istio.adaptive.request.optimizer/optimize", "The label to use for setting that the ServiceEntry object is optimized")
-	flag.StringVar(&serviceEntryServiceNameLabelKey, "serviceentry-service-name-label", "istio.adaptive.request.optimizer/service-name", "The label to use for setting the service name in the ServiceEntry object")
 	flag.StringVar(&namespaces, "namespaces", "", "Comma-separated list of namespaces to watch")
 	flag.StringVar(&queryInterval, "query-interval", "1m", "The time range over which to aggregate metrics when querying the VMDB service")
-	flag.StringVar(&stepInterval, "step-interval", "20s", "The granularity of the data points returned by Prometheus when querying the VMDB service")
-	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 30, "The time in seconds to run the optimization cycle")
+	flag.StringVar(&stepInterval, "step-interval", "60s", "The granularity of the data points returned by Prometheus when querying the VMDB service")
+	flag.IntVar(&optimizeCycleTime, "optimize-cycle-time", 60, "The time in seconds to run the optimization cycle")
 	flag.IntVar(&minimumWeight, "minimum-weight", 100, "The minimum weight for an endpoint to get, increasing this will make the split between the slowest and fastest endpoints smaller")
-	flag.IntVar(&maximumWeight, "maximum-weight", 600, "The maximum weight to use for the endpoints, decreasing this will make the split between the slowest and fastest endpoints smaller")
+	flag.IntVar(&initialWeight, "initial-weight", 400, "The initial weight to use for the endpoints, this value will be used for new endpoints")
+	flag.IntVar(&maximumWeight, "maximum-weight", 3000, "The maximum weight for an endpoint to get, decreasing this will make the split between the slowest and fastest endpoints smaller")
 	// Define flags with percentage names
-	flag.Float64Var(&minOptimizeCpuDistancePercent, "min-optimize-cpu-distance-percent", 5.0, "The minimum distance percentage between the CPU usage of the pods and the mean CPU of the service, below that value the optimization cycle will be skipped for that pods")
-	flag.Float64Var(&cpuDistanceMultiplierPercent, "cpu-distance-multiplier-percent", 1.0, "The multiplier percentage to use to convert the CPU distance to weight changes, the weight will be calculated as 1 - (cpuDistance * CpuDistanceMultiplierPercent)")
-	flag.IntVar(&newEndpointsPercentileWeight, "new-endpoints-percentile-weight", 50, "The percentile weight to use for the new endpoints, higher value means that new endpoints will start with a higher weight")
+	flag.Float64Var(&scaleupFactor, "scale-up-factor", 0.15, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scaleupFactor")
+	flag.Float64Var(&scaledownFactor, "scale-down-factor", 0.15, "The scaling factor to use for the CPU distance, the CPU distance will be calculated as (podCpuUsage - serviceCpuUsage) * scaleupFactor")
 	flag.StringVar(&vmdbUrl, "vmdb-url", "http://ilo-vm-single-server:8428", "The URL of the VMDB service")
-	opts := zap.Options{
-		Development: true,
-	}
+
+	opts := zap.Options{}
+	// Define Log Level of the application
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	// Split the namespaces string into a list
 	var namespaceList []string
-	if namespaces != "" {
-		namespaceList = strings.Split(namespaces, ",")
-	}
-
-	if newEndpointsPercentileWeight < 0 || newEndpointsPercentileWeight > 100 {
-		setupLog.Error(nil, "new-endpoints-percentile-weight must be between 0 and 100")
+	if len(namespaces) == 0 {
+		setupLog.Error(nil, "Failed to set up namespaces", "namespaces", namespaces)
 		os.Exit(1)
 	}
+	namespaceList = strings.Split(namespaces, ",")
 
-	if optimizeCycleTime < 0 || optimizeCycleTime > 360 {
-		setupLog.Error(nil, "optimize-time must be between 0 and 360")
-		os.Exit(1)
-	}
-
-	if optimizeCycleTime == 0 {
-		setupLog.Info("optimize-time is set to 0, the optimize cycle can't be disabled")
+	if optimizeCycleTime <= 0 || optimizeCycleTime > 600 {
+		setupLog.Error(nil, "optimize-time must be between 0 and 600 seconds")
 		os.Exit(1)
 	}
 
@@ -144,14 +130,13 @@ func main() {
 	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
 	// Rapid Reset CVEs. For more information see:
 	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
-	}
-
-	tlsOpts := []func(*tls.Config){}
+	// - https://github.com/advisories/GHSA-4374-p667-p6c
+	var tlsOpts []func(*tls.Config)
 	if !enableHTTP2 {
+		disableHTTP2 := func(c *tls.Config) {
+			setupLog.Info("disabling http/2")
+			c.NextProtos = []string{"http/1.1"}
+		}
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
@@ -188,61 +173,31 @@ func main() {
 	}
 
 	if err = (&controller.IstioAdaptiveRequestOptimizerReconciler{
-		Client:                          mgr.GetClient(),
-		Scheme:                          mgr.GetScheme(),
-		LoggerName:                      "IstioAdaptiveRequestOptimizer",
-		EndpointsAnnotationKey:          &endpointsAnnotationKey,
-		EndpointsPodScrapeAnnotationKey: &endpointPodScrapeAnnotationKey,
-		ServiceEntryLabelKey:            &serviceEntryLabelKey,
-		ServiceEntryServiceNameLabelKey: &serviceEntryServiceNameLabelKey,
-		NamespaceList:                   namespaceList,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		LoggerName:      "IstioAdaptiveRequestOptimizer",
+		NamespaceList:   namespaceList,
+		RequeueAfter:    time.Duration(optimizeCycleTime) * time.Second,
+		QueryInterval:   queryInterval,
+		VmdbUrl:         vmdbUrl,
+		StepInterval:    stepInterval,
+		ScaleupFactor:   scaleupFactor,
+		ScaledownFactor: scaledownFactor,
+		MinimumWeight:   minimumWeight,
+		MaximumWeight:   maximumWeight,
+		InitialWeight:   initialWeight,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IstioAdaptiveRequestOptimizer")
 		os.Exit(1)
 	}
-	//Create the channel for triggering ServiceEntry reconciliation
-	serviceEntryReconcileTriggerChannel := make(chan event.GenericEvent, 100)
-	if err = (&controller.EndpointReconciler{
-		Client:                              mgr.GetClient(),
-		Scheme:                              mgr.GetScheme(),
-		LoggerName:                          "EndpointController",
-		EndpointsAnnotationKey:              &endpointsAnnotationKey,
-		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
-		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
-		NamespaceList:                       namespaceList,
+	if err = (&controller.EndpointSliceReconciler{
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		LoggerName:    "EndpointSlice",
+		NamespaceList: namespaceList,
+		InitialWeight: uint32(initialWeight),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Endpoint")
-		os.Exit(1)
-	}
-	if err = (&controller.WeightOptimizerReconciler{
-		Client:                        mgr.GetClient(),
-		Scheme:                        mgr.GetScheme(),
-		LoggerName:                    "WeightOptimizerController",
-		VmdbUrl:                       &vmdbUrl,
-		NamespaceList:                 namespaceList,
-		RequeueAfter:                  time.Duration(optimizeCycleTime),
-		MaximumWeight:                 maximumWeight,
-		MinimumWeight:                 minimumWeight,
-		QueryInterval:                 queryInterval,
-		StepInterval:                  stepInterval,
-		MinOptimizeCpuDistancePercent: minOptimizeCpuDistancePercent,
-		CpuDistanceMultiplierPercent:  cpuDistanceMultiplierPercent,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "WeightOptimizer")
-		os.Exit(1)
-	}
-	if err = (&controller.ServiceEntryReconciler{
-		Client:                              mgr.GetClient(),
-		Scheme:                              mgr.GetScheme(),
-		LoggerName:                          "ServiceEntryController",
-		ServiceEntryReconcileTriggerChannel: serviceEntryReconcileTriggerChannel,
-		ServiceEntryServiceNameLabelKey:     &serviceEntryServiceNameLabelKey,
-		NamespaceList:                       namespaceList,
-		NewEndpointsPercentileWeight:        newEndpointsPercentileWeight,
-		MaximumWeight:                       maximumWeight,
-		MinimumWeight:                       minimumWeight,
-	}).SetupWithManager(mgr, setupLog); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "ServiceEntry")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

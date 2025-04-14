@@ -5,10 +5,12 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - ""
+  - coordination.k8s.io
   resources:
-  - endpoints
+  - leases
   verbs:
+  - create
+  - delete
   - get
   - list
   - patch
@@ -21,8 +23,6 @@ rules:
   verbs:
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - ""
@@ -31,8 +31,14 @@ rules:
   verbs:
   - get
   - list
-  - patch
-  - update
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - networking.istio.io
@@ -40,18 +46,11 @@ rules:
   - serviceentries
   verbs:
   - create
-  - delete
   - get
   - list
   - patch
   - update
   - watch
-- apiGroups:
-  - networking.istio.io
-  resources:
-  - serviceentries/finalizers
-  verbs:
-  - update
 - apiGroups:
   - networking.istio.io
   resources:
@@ -65,75 +64,15 @@ rules:
   resources:
   - istioadaptiverequestoptimizers
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
   - update
   - watch
-- apiGroups:
-  - optimization.liorfranko.github.io
-  resources:
-  - istioadaptiverequestoptimizers/finalizers
-  verbs:
-  - update
 - apiGroups:
   - optimization.liorfranko.github.io
   resources:
   - istioadaptiverequestoptimizers/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - optimization.liorfranko.github.io
-  resources:
-  - serviceentries
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - optimization.liorfranko.github.io
-  resources:
-  - serviceentries/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - optimization.liorfranko.github.io
-  resources:
-  - serviceentries/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - optimization.liorfranko.github.io
-  resources:
-  - weightoptimizers
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - optimization.liorfranko.github.io
-  resources:
-  - weightoptimizers/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - optimization.liorfranko.github.io
-  resources:
-  - weightoptimizers/status
   verbs:
   - get
   - patch

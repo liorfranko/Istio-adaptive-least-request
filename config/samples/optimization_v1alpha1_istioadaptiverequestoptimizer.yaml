@@ -1,9 +1,28 @@
 apiVersion: optimization.liorfranko.github.io/v1alpha1
 kind: IstioAdaptiveRequestOptimizer
 metadata:
+  name: retail-api-optimizer
+  namespace: default
   labels:
-    app.kubernetes.io/name: istio-adpative-least-request
-    app.kubernetes.io/managed-by: kustomize
-  name: istioadaptiverequestoptimizer-sample
+    app.kubernetes.io/name: istio-adaptive-least-request
+    app.kubernetes.io/component: load-balancer
+    app.kubernetes.io/part-of: service-mesh
 spec:
-  # TODO(user): Add fields here
+  # Service to optimize
+  service_name: retail-api-service
+  service_namespace: default
+  
+  # Enable zone-aware routing for multi-zone clusters
+  locality_enabled: true
+  
+  # Define ports and protocols to optimize
+  service_ports:
+    # Main HTTP API endpoint
+    - number: 8080
+      protocol: http
+      targetPort: 8080
+    
+    # gRPC internal service endpoint
+    - number: 9090
+      protocol: grpc
+      targetPort: 9090

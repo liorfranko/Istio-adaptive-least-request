@@ -1,44 +1,37 @@
-/*
-Copyright 2024.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/montanaflynn/stats"
 	"github.com/prometheus/client_golang/prometheus"
-	optimizationv1alpha1 "istio-adaptive-least-request/api/v1alpha1"
-	"istio-adaptive-least-request/internal/helpers"
-	customMetrics "istio-adaptive-least-request/internal/metrics"
-	//istioNetworkingV1beta1 "istio.io/api/networking/v1beta1"
-	//istioClientV1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istioNetworkingV1 "istio.io/api/networking/v1"
+	istioapinetworkingv1 "istio.io/api/networking/v1"
 	istioClientV1 "istio.io/client-go/pkg/apis/networking/v1"
+	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	clientPkg "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"strings"
-	_ "strings"
-)
 
-const istioAdaptiveRequestOptimizerFinalizer = "optimization.liorfranko.github.io/finalizer"
+	api "istio-adaptive-least-request/api/v1alpha1"
+	"istio-adaptive-least-request/internal/metrics"
+)
 
 // DefaultWeightForNewEndpoints represents the default weight assigned to new endpoints in a ServiceEntry.
 const DefaultWeightForNewEndpoints uint32 = 1000
@@ -46,412 +39,631 @@ const DefaultWeightForNewEndpoints uint32 = 1000
 // IstioAdaptiveRequestOptimizerReconciler reconciles a IstioAdaptiveRequestOptimizer object
 type IstioAdaptiveRequestOptimizerReconciler struct {
 	client.Client
-	Scheme                          *runtime.Scheme
-	LoggerName                      string
-	EndpointsAnnotationKey          *string
-	EndpointsPodScrapeAnnotationKey *string
-	ServiceEntryLabelKey            *string
-	ServiceEntryServiceNameLabelKey *string
-	NamespaceList                   []string
+	Scheme          *runtime.Scheme
+	LoggerName      string
+	NamespaceList   []string
+	RequeueAfter    time.Duration
+	QueryInterval   string
+	VmdbUrl         string
+	StepInterval    string
+	ScaleupFactor   float64
+	ScaledownFactor float64
+	MinimumWeight   int
+	InitialWeight   int
+	MaximumWeight   int
 }
 
-// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=optimization.liorfranko.github.io,resources=istioadaptiverequestoptimizers/finalizers,verbs=update
-//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=core,resources=endpoints,verbs=update;patch;get;list;watch
-//+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+//+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries/finalizers,verbs=update
+//+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 func (r *IstioAdaptiveRequestOptimizerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.V(1).Info("Reconcile IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer.Namespace", req.Namespace, "IstioAdaptiveRequestOptimizer.Name", req.Name)
-	// Fetch the IstioAdaptiveRequestOptimizer instance
-	optimizer := &optimizationv1alpha1.IstioAdaptiveRequestOptimizer{}
-	if err := r.Get(ctx, req.NamespacedName, optimizer); err != nil {
-		logger.Info("IstioAdaptiveRequestOptimizer not found", "Namespace", req.Namespace, "Name", req.Name)
+	logger.Info("Starting reconcile IstioAdaptiveRequestOptimizer")
+	var opt api.IstioAdaptiveRequestOptimizer
+	if err := r.Get(ctx, req.NamespacedName, &opt); err != nil {
+		logger.Info("IstioAdaptiveRequestOptimizer not found",
+			"Namespace", req.Namespace,
+			"Name", req.Name,
+		)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	logger.V(1).Info("IstioAdaptiveRequestOptimizer fetched", "IstioAdaptiveRequestOptimizer", optimizer.Spec)
-
-	if optimizer.GetDeletionTimestamp() != nil {
-		logger.Info("IstioAdaptiveRequestOptimizer marked for deletion", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-		_, err := r.handleFinalizer(ctx, optimizer)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
+	logger.V(1).Info("IstioAdaptiveRequestOptimizer fetched",
+		"IstioAdaptiveRequestOptimizer", opt.Spec,
+	)
+	if opt.GetDeletionTimestamp() != nil {
+		logger.Info("IstioAdaptiveRequestOptimizer marked for deletion",
+			"IstioAdaptiveRequestOptimizer", opt.Name,
+		)
 		return ctrl.Result{}, nil
 	}
-
-	// If the object is not marked for deletion and does not have a finalizer
-	if !helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
-		// Attempt to add the finalizer
-		logger.Info("Finalizer not found, adding finalizer")
-		if err := r.addFinalizer(ctx, optimizer); err != nil {
-			logger.Error(err, "Failed to add finalizer")
-			// Return with error to requeue and try adding finalizer again
+	var service corev1.Service
+	objectKey := client.ObjectKey{
+		Name:      opt.Spec.ServiceName,
+		Namespace: opt.Spec.ServiceNamespace,
+	}
+	if err := r.Get(ctx, objectKey, &service); err != nil {
+		logger.Error(err, "Failed to fetch Service", "ServiceName", opt.Spec.ServiceName)
+		return ctrl.Result{}, err
+	}
+	logger.V(1).Info("Service fetched", "Service", &service)
+	var serviceEntry istioClientV1.ServiceEntry
+	objectKey = client.ObjectKey{
+		Name:      opt.Name,
+		Namespace: opt.Namespace,
+	}
+	if err := r.Get(ctx, objectKey, &serviceEntry); err != nil {
+		if !errors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-	}
-
-	// Fetch the Service based on the optimizer spec
-	service := &corev1.Service{}
-	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, service); err != nil {
-		logger.Error(err, "Failed to fetch Service", "ServiceName", optimizer.Spec.ServiceName)
-		return ctrl.Result{}, err
-	}
-	logger.V(1).Info("Service fetched", "Service", service)
-	// Fetch the Endpoints object matching the service
-	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, client.ObjectKey{Name: service.Name, Namespace: service.Namespace}, endpoints); err != nil {
-		logger.Error(err, "Failed to fetch Endpoints for Service", "ServiceName", service.Name)
-		return ctrl.Result{}, err
-	}
-	if err := r.annotateEndpoints(ctx, *endpoints, optimizer); err != nil {
-		logger.Error(err, "Failed to annotate Endpoints", "ServiceName", service.Name)
-		return ctrl.Result{}, err
-	}
-
-	portsToProcess := r.collectPortsToProcess(optimizer, service)
-	logger.V(1).Info("Ports to process", "Ports", portsToProcess)
-	var createdServiceEntries []*istioClientV1.ServiceEntry
-	for _, port := range portsToProcess {
-		// Assume createServiceEntry returns a pointer to a ServiceEntry and error
-		serviceEntry, err := r.createServiceEntry(ctx, service, port, endpoints.Subsets, *optimizer)
-		if err != nil {
-			logger.Error(err, "Failed to create ServiceEntry for port", "Port", port.Port)
-			// TODO: Add a metric for failed ServiceEntry creation
-			continue // Skip this iteration on error
+		var endpointSliceList discoveryv1.EndpointSliceList
+		labelSelector := client.MatchingLabels{
+			discoveryv1.LabelServiceName: service.Name,
 		}
-		createdServiceEntries = append(createdServiceEntries, serviceEntry)
+		if err := r.List(ctx, &endpointSliceList, client.InNamespace(service.Namespace), labelSelector); err != nil {
+			logger.Error(err, "Failed to list EndpointSlices for Service", "ServiceName", service.Name)
+			return ctrl.Result{}, err
+		}
+		r.initServiceEntry(ctx, &service, endpointSliceList.Items, &opt, &serviceEntry)
+		if err := r.Create(ctx, &serviceEntry); err != nil {
+			logger.Error(err, "Failed to create ServiceEntry",
+				"ServiceEntry", serviceEntry.Name,
+			)
+			return ctrl.Result{}, err
+		}
+		logger.Info("ServiceEntry created successfully",
+			"ServiceEntry", serviceEntry.Name,
+		)
+	} else {
+		if len(serviceEntry.Spec.Endpoints) == 0 {
+			logger.Info("ServiceEntry doesn't have any endpoints, continue",
+				"ServiceEntry", serviceEntry.Name,
+			)
+			return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
+		}
+		getPodMetricsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		podAddressToPodMetrics, err := getPodMetrics(
+			getPodMetricsCtx,
+			logger,
+			opt.Namespace,
+			&serviceEntry,
+			r.QueryInterval,
+			r.VmdbUrl,
+			r.StepInterval,
+		)
+		if err != nil {
+			logger.Error(err, "Failed to get pod metrics")
+			// If there is a problem with pulling the metrics from VictoriaMetrics, log an error and continue to the next port
+			metrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName,
+				"type":      "get_metrics_from_vm",
+				"name":      opt.Name,
+				"namespace": opt.Namespace,
+			}).Inc()
+			if err := fallbackStrategy(ctx, logger, r.Client, &opt, &serviceEntry, uint32(r.InitialWeight)); err != nil {
+				metrics.ErrorMetrics.With(prometheus.Labels{"controller": r.LoggerName,
+					"type":      "fallback_strategy",
+					"name":      opt.Name,
+					"namespace": opt.Namespace,
+				}).Inc()
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
+		}
+		// log which metrics we got from the vm db
+		logger.Info("Pod metrics from VictoriaMetrics", "podAddressToPodMetrics", podAddressToPodMetrics)
+		distributeWeightsBasedOnCPU(
+			logger,
+			podAddressToPodMetrics,
+			&serviceEntry,
+			opt.Spec.LocalityEnabled,
+			r.ScaleupFactor,
+			r.ScaledownFactor,
+			r.MinimumWeight,
+			r.MaximumWeight,
+		)
+		logger.Info("Trying to update ServiceEntry", "ServiceEntry", serviceEntry.Name)
+		if err := r.Update(ctx, &serviceEntry); err != nil {
+			logger.Error(err, "Failed to validate or update weights.")
+			return ctrl.Result{}, err
+		}
+		logger.Info("Successfully updated ServiceEntry", "ServiceEntry", serviceEntry.Name)
+		updateMetrics(&serviceEntry)
 	}
-
-	if err := r.updateOptimizerStatus(ctx, optimizer, createdServiceEntries); err != nil {
-		logger.Error(err, "Failed to update optimizer status with service entries")
+	status := &opt.Status
+	now := metav1.Now()
+	status.LastOptimizedTime = &now
+	status.ObservedGeneration = opt.Generation
+	status.ServiceEntries = []api.ServiceEntry{{
+		Name:         serviceEntry.Name,
+		Namespace:    serviceEntry.Namespace,
+		CreationTime: serviceEntry.CreationTimestamp,
+	}} // TODO(romang): change ServiceEntries to ServiceEntry
+	if err := r.Client.Status().Update(ctx, &opt); err != nil {
+		// TODO: roman check why.
+		logger.Error(err, "Failed to update opt status with service entries")
 		return ctrl.Result{}, err
 	}
-
-	return ctrl.Result{}, nil
+	// Requeue reconciliation every 60 seconds to track new EndpointSlices.
+	return ctrl.Result{RequeueAfter: r.RequeueAfter}, nil
 }
 
-func (r *IstioAdaptiveRequestOptimizerReconciler) serviceEntryExists(ctx context.Context, namespace, name string) *istioClientV1.ServiceEntry {
-	var serviceEntry istioClientV1.ServiceEntry
-	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, &serviceEntry)
+type tVmDBItem struct {
+	Metric struct {
+		PodAddress string `json:"pod_ip"`
+	} `json:"metric"`
+	Value []any `json:"value"`
+}
+
+// getVMQueryMetric queries VictoriaMetrics for the given service and protocol and returns the response.
+func getPodMetrics(
+	ctx context.Context,
+	logger logr.Logger,
+	namespace string,
+	serviceEntry *istioClientV1.ServiceEntry,
+	queryInterval string,
+	vmDbUrl string,
+	stepInterval string,
+) (map[string]float64, error) {
+	unfilteredPodAddressToCPUTime, err := getCPUMetrics(
+		ctx,
+		logger,
+		serviceEntry.Name,
+		namespace,
+		queryInterval,
+		vmDbUrl,
+		stepInterval,
+	)
 	if err != nil {
+		return nil, err
+	}
+	if len(unfilteredPodAddressToCPUTime) == 0 {
+		return nil, fmt.Errorf("empty metrics returned from VM DB")
+	}
+
+	endpoints := serviceEntry.Spec.Endpoints
+	podAddressToCPUTime := make(map[string]float64, len(endpoints))
+	cpuTimesSum := 0.0
+	cpuTimeLen := 0
+	for _, workloadEntry := range endpoints {
+		address := workloadEntry.Address
+		cpuTime, ok := unfilteredPodAddressToCPUTime[address]
+		if ok && cpuTime > 0.0 {
+			cpuTimesSum += cpuTime
+			cpuTimeLen++
+		}
+		podAddressToCPUTime[address] = cpuTime
+	}
+	avgCPU := cpuTimesSum / float64(cpuTimeLen)
+	// if avgCpu is smaller than 0.2, treat it like there is no data from VM DB
+	if avgCPU < 0.2 {
+		return nil, fmt.Errorf("average CPU is less than 0.2")
+	}
+	for address, cpuTime := range podAddressToCPUTime {
+		if cpuTime == 0.0 {
+			// maybe we can remove this logic if the log not appear
+			logger.Info(fmt.Sprintf("Pod address %s has no CPU time", address))
+			podAddressToCPUTime[address] = avgCPU
+		}
+	}
+	return podAddressToCPUTime, nil
+}
+
+func getCPUMetrics(
+	ctx context.Context,
+	logger logr.Logger,
+	service string,
+	namespace string,
+	queryInterval string,
+	vmDbUrl string,
+	stepInterval string,
+) (map[string]float64, error) {
+	logger.Info("Querying CPU from VictoriaMetrics for service")
+	query := fmt.Sprintf(
+		`sum(rate(container_cpu_usage_seconds_total{namespace="%s",container="%s"}[%s]) * on(pod) group_left(pod_ip) first_over_time(kube_pod_info{namespace="%s", pod=~"%s.*", pod_ip!=""}[1m])) by (pod_ip)`,
+		namespace,
+		service,
+		queryInterval,
+		namespace,
+		service,
+	)
+
+	logger.V(1).Info("query", "query", query)
+	// Start timer
+	startTime := time.Now()
+	cpuTimes, err := getVMCPUQueryMetric(ctx, logger, query, vmDbUrl, stepInterval)
+	if err != nil {
+		return nil, err
+	}
+	// Measure elapsed time
+	elapsedTime := time.Since(startTime).Seconds() // in seconds
+	queryLabels := prometheus.Labels{
+		"service_name":      service,
+		"service_namespace": namespace,
+	}
+	metrics.QueryLatencyMetric.With(queryLabels).Set(elapsedTime)
+	podAddressToCPUTime := make(map[string]float64)
+	for i := range cpuTimes {
+		v := &cpuTimes[i]
+		if len(v.Value) < 2 {
+			return nil, fmt.Errorf("error parsing ResponseTime for pod %v: %w", v.Metric.PodAddress, err)
+		}
+		cpuTime, err := strconv.ParseFloat(v.Value[1].(string), 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing ResponseTime for pod %v: %w", v.Metric.PodAddress, err)
+		}
+		podAddress := v.Metric.PodAddress
+		podAddressToCPUTime[podAddress] = cpuTime
+	}
+	return podAddressToCPUTime, nil
+}
+
+func closeDeferred(logger logr.Logger, closer io.Closer) {
+	if err := closer.Close(); err != nil {
+		logger.Error(err, "Failed to close the closer")
+	}
+}
+
+func getVMCPUQueryMetric(
+	ctx context.Context,
+	logger logr.Logger,
+	query string,
+	vmDbUrl string,
+	stepInterval string,
+) ([]tVmDBItem, error) {
+	query = url.QueryEscape(query)
+	apiURL := fmt.Sprintf("%s/prometheus/api/v1/query?query=%s&step=%s", vmDbUrl, query, stepInterval)
+	logger.V(1).Info("Querying VictoriaMetrics", "apiURL", apiURL)
+	// Create an HTTP client and make the request
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer closeDeferred(logger, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	var vmDBRes struct {
+		Data struct {
+			Result []tVmDBItem `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&vmDBRes); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	logger.V(1).Info("Response from VictoriaMetrics", "vmDBRes", vmDBRes)
+	return vmDBRes.Data.Result, nil
+}
+
+func fallbackStrategy(
+	ctx context.Context,
+	logger logr.Logger,
+	client clientPkg.Client,
+	opt *api.IstioAdaptiveRequestOptimizer,
+	serviceEntry *istionetworkingv1.ServiceEntry,
+	resetWeight uint32,
+) error {
+	logger.Info("Initiating fallback strategy check")
+	if shouldSkipFallback(opt) {
+		logger.Info("Recent optimization detected; skipping fallback strategy")
+		// When the controller restart and have no metrics, we need to create the metrics in case there are no updates.
+		updateMetrics(serviceEntry)
 		return nil
 	}
-	return &serviceEntry
+	if err := resetWeights(ctx, logger, client, serviceEntry, resetWeight); err != nil {
+		return err
+	}
+	logger.Info("Weights reset to default due to timeout")
+	return nil
 }
 
-// createServiceEntry constructs a ServiceEntry resource based on the provided Service and ServicePort.
-// It then creates the ServiceEntry in the Kubernetes API server.
-func (r *IstioAdaptiveRequestOptimizerReconciler) createServiceEntry(ctx context.Context, service *corev1.Service, port corev1.ServicePort, subsets []corev1.EndpointSubset, optimizer optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (*istioClientV1.ServiceEntry, error) {
-	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	host := fmt.Sprintf("%s.%s.svc.cluster.local", service.Name, service.Namespace)
+// Helper function to decide whether to skip fallback based on optimization times.
+func shouldSkipFallback(opt *api.IstioAdaptiveRequestOptimizer) bool {
+	optimizedTime := opt.Status.LastOptimizedTime
+	if optimizedTime == nil {
+		return false
+	}
+	return time.Since(optimizedTime.Time) < 10*time.Minute
+}
 
-	var serviceEntryEndpoints []*istioNetworkingV1.WorkloadEntry
-	for _, subset := range subsets {
-		for _, address := range subset.Addresses {
-			serviceEndpoint := &istioNetworkingV1.WorkloadEntry{
-				Address: address.IP,
-				Weight:  DefaultWeightForNewEndpoints,
-			}
-			serviceEntryEndpoints = append(serviceEntryEndpoints, serviceEndpoint)
+func resetWeights(
+	ctx context.Context,
+	logger logr.Logger,
+	client clientPkg.Client,
+	serviceEntry *istionetworkingv1.ServiceEntry,
+	resetWeight uint32,
+) error {
+	logger.Info("Resetting weights to default values", "serviceEntry", serviceEntry.Name)
+	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
+		workloadEntry.Weight = resetWeight
+	}
+	logger.Info("Trying to update serviceEntry", "serviceEntry", serviceEntry.Name)
+	if err := client.Update(ctx, serviceEntry); err != nil {
+		logger.Error(err, "Failed to update serviceEntry", "serviceEntry", serviceEntry.Name)
+		return err
+	}
+	updateMetrics(serviceEntry)
+	logger.Info("ServiceEntry updated successfully", "serviceEntry", serviceEntry.Name)
+	return nil
+}
+
+func distributeWeightsBasedOnCPU(
+	logger logr.Logger,
+	podAddressToCPUTime map[string]float64,
+	serviceEntry *istionetworkingv1.ServiceEntry,
+	localityEnabled bool,
+	scaleupFactor float64,
+	scaledownFactor float64,
+	minimumWeight int,
+	maximumWeight int,
+) {
+	podAddressToWorkloadEntry := make(map[string]*istioapinetworkingv1.WorkloadEntry)
+	podAddressToLocality := make(map[string]string)
+	for _, workloadEntry := range serviceEntry.Spec.Endpoints {
+		podAddressToWorkloadEntry[workloadEntry.Address] = workloadEntry
+		if localityEnabled {
+			podAddressToLocality[workloadEntry.Address] = workloadEntry.Locality
+		} else {
+			workloadEntry.Locality = ""
+		}
+	}
+	type tPodCPUTime struct {
+		address string
+		cpuTime float64
+	}
+	groups := make(map[string][]tPodCPUTime, len(podAddressToCPUTime))
+	for address := range podAddressToWorkloadEntry {
+		locality := ""
+		if localityEnabled {
+			locality = podAddressToLocality[address]
+		}
+		cpuTime, ok := podAddressToCPUTime[address]
+		if ok {
+			groups[locality] = append(groups[locality], tPodCPUTime{
+				address: address,
+				cpuTime: cpuTime,
+			})
 		}
 	}
 
-	// Construct the ServiceEntry resource
-	serviceEntry := &istioClientV1.ServiceEntry{
+	// Process each locality group
+	for localityKey, groupPods := range groups {
+		logger.V(4).Info("Processing group", "localityKey", localityKey, "groupPods", groupPods)
+
+		// Calculate group total weight
+		var groupTotalWeight float64
+		for i := range groupPods {
+			podCPUTime := &groupPods[i]
+			address := podCPUTime.address
+			groupTotalWeight += float64(podAddressToWorkloadEntry[address].Weight)
+		}
+
+		// Check if group total weight is below minimum threshold
+		minGroupTotal := float64(len(groupPods)) * 200.0
+		if groupTotalWeight < minGroupTotal {
+			for _, pm := range groupPods {
+				podAddressToWorkloadEntry[pm.address].Weight *= 5
+			}
+			continue
+		}
+
+		// Calculate average CPU for the group
+		var cpuTimes []float64
+		for i := range groupPods {
+			podCPUTime := &groupPods[i]
+			cpuTime := podCPUTime.cpuTime
+			cpuTimes = append(cpuTimes, cpuTime)
+		}
+		avgCPU, _ := stats.Mean(cpuTimes)
+		// Calculate X_sum for the "cake" formula
+		var xSum float64
+		for _, pm := range groupPods {
+			if pm.cpuTime > 0 {
+				xSum += avgCPU / pm.cpuTime * float64(podAddressToWorkloadEntry[pm.address].Weight)
+			}
+		}
+
+		// Adjust weights for each pod in the group
+		for _, pm := range groupPods {
+			currentWeight := float64(podAddressToWorkloadEntry[pm.address].Weight)
+			if currentWeight == 0 {
+				// TODO: its hack we need change the iteration to be based on the serviceEntryWeightsMap in next version.
+				logger.Info("Weight is 0, skipping",
+					"address", pm.address,
+				)
+				podAddressToWorkloadEntry[pm.address].Weight = uint32(minimumWeight)
+				continue
+			}
+			newShare := (avgCPU / pm.cpuTime) * (currentWeight / xSum) * groupTotalWeight
+			rawDistance := newShare - currentWeight
+			scalingFactor := scaleupFactor
+			if rawDistance < 0 {
+				scalingFactor = scaledownFactor
+			}
+			adjustedWeight := currentWeight + scalingFactor*(newShare-currentWeight)
+
+			// Cap big spikes
+			distance := adjustedWeight - currentWeight
+			//maxAllowedDistance := avgGroupWeight / 4
+			maxAllowedDistance := 250.0
+			if distance > maxAllowedDistance {
+				adjustedWeight = currentWeight + maxAllowedDistance
+			}
+			if adjustedWeight < float64(minimumWeight) {
+				logger.Info("Adjusted weight is less than minimumWeight, setting it to minimumWeight Weight optimization",
+					"address", pm.address,
+					"cpuTime", pm.cpuTime,
+					"Weight", podAddressToWorkloadEntry[pm.address].Weight,
+					"NewShare", newShare,
+					"AdjustedWeight", adjustedWeight,
+					"Distance", distance,
+					"MaxAllowedDistance", maxAllowedDistance,
+					"avgCPU", avgCPU,
+					"xSum", xSum,
+					"scaleupFactor", scaleupFactor,
+					"scaledownFactor", scaledownFactor,
+					"currentWeight", currentWeight,
+					"minimumWeight", minimumWeight,
+				)
+				adjustedWeight = float64(minimumWeight)
+			}
+
+			podAddressToWorkloadEntry[pm.address].Weight = uint32(adjustedWeight)
+		}
+		// Normalize weights to keep the average weight equal to 1000
+		var totalWeight float64
+		for _, podMetrics := range groupPods {
+			totalWeight += float64(podAddressToWorkloadEntry[podMetrics.address].Weight)
+		}
+		normalizationFactor := (1000 * float64(len(groupPods))) / totalWeight
+		for _, podMetrics := range groupPods {
+			weight := uint32(float64(podAddressToWorkloadEntry[podMetrics.address].Weight) * normalizationFactor)
+			if weight > uint32(maximumWeight) {
+				weight = uint32(maximumWeight)
+			}
+			if weight < uint32(minimumWeight) {
+				weight = uint32(minimumWeight)
+			}
+			podAddressToWorkloadEntry[podMetrics.address].Weight = weight
+		}
+	}
+}
+
+func (r *IstioAdaptiveRequestOptimizerReconciler) initServiceEntry(
+	ctx context.Context,
+	service *corev1.Service,
+	endpointSlices []discoveryv1.EndpointSlice,
+	opt *api.IstioAdaptiveRequestOptimizer,
+	serviceEntry *istioClientV1.ServiceEntry,
+) {
+	logger := log.FromContext(ctx).WithName(r.LoggerName)
+	existAddresses := make(map[string]struct{})
+	var serviceEntryEndpoints []*istioNetworkingV1.WorkloadEntry
+	for i := range endpointSlices {
+		endpointSlice := &endpointSlices[i]
+		if !endpointSlice.DeletionTimestamp.IsZero() {
+			// Skip deleted EndpointSlices
+			continue
+		}
+		for _, endpoint := range endpointSlice.Endpoints {
+			if readyPtr := endpoint.Conditions.Ready; readyPtr == nil || !*readyPtr {
+				logger.Info("Endpoint is not ready", "Endpoint", endpoint)
+				continue
+			}
+			var address string
+			if addresses := endpoint.Addresses; len(addresses) > 0 {
+				address = addresses[0]
+			}
+			if address == "" {
+				// TODO(romang): check why this happens, if it is
+				logger.Info("Endpoint has no address", "Endpoint", endpoint)
+				continue
+			}
+			if _, ok := existAddresses[address]; ok {
+				// Skip duplicate endpoints
+				// https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/#duplicate-endpoints
+				continue
+			}
+			existAddresses[address] = struct{}{}
+			workloadEntry := &istioNetworkingV1.WorkloadEntry{
+				Address: address,
+				Weight:  DefaultWeightForNewEndpoints,
+			}
+			if opt.Spec.LocalityEnabled {
+				if zonePtr := endpoint.Zone; zonePtr != nil {
+					zone := *zonePtr
+					workloadEntry.Locality = zone[:len(zone)-1] + "/" + zone
+				}
+			}
+			serviceEntryEndpoints = append(serviceEntryEndpoints, workloadEntry)
+		}
+	}
+	*serviceEntry = istioClientV1.ServiceEntry{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "networking.istio.io/v1",
 			Kind:       "ServiceEntry",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      service.Name + "-" + fmt.Sprint(port.Port),
+			Name:      service.Name,
 			Namespace: service.Namespace,
-			Labels: map[string]string{
-				*r.ServiceEntryLabelKey:            "true",
-				*r.ServiceEntryServiceNameLabelKey: service.Name,
-			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
-					Name:       optimizer.Name,
-					APIVersion: optimizer.APIVersion,
-					Kind:       optimizer.Kind,
-					UID:        optimizer.UID,
+					Name:       opt.Name,
+					APIVersion: opt.APIVersion,
+					Kind:       opt.Kind,
+					UID:        opt.UID,
 				},
 			},
 		},
 		Spec: istioNetworkingV1.ServiceEntry{
-			Hosts: []string{host},
-			Ports: []*istioNetworkingV1.ServicePort{
-				{
-					Number:   uint32(port.Port),
-					Protocol: helpers.SafeDereferenceAppProtocol(port.AppProtocol),
-					Name:     port.Name,
-				},
-			},
+			Hosts:      []string{service.Name + "." + service.Namespace + ".svc.cluster.local"},
 			Endpoints:  serviceEntryEndpoints,
 			Location:   istioNetworkingV1.ServiceEntry_MESH_INTERNAL,
 			Resolution: istioNetworkingV1.ServiceEntry_STATIC,
 		},
 	}
-
-	existServiceEntry := r.serviceEntryExists(ctx, service.Namespace, service.Name+"-"+fmt.Sprint(port.Port))
-	if existServiceEntry != nil {
-		//logger.Info("ServiceEntry already exists", "ServiceEntry", service.Name+"-"+fmt.Sprint(port.Port))
-		return existServiceEntry, nil
-	}
-
-	// Create ServiceEntry resource
-	logger.Info("Creating ServiceEntry", "ServiceEntry", serviceEntry.Name)
-	err := r.Create(ctx, serviceEntry)
-	if err != nil {
-		logger.Error(err, "Failed to create ServiceEntry", "ServiceEntry", serviceEntry.Name)
-		return nil, err
-	}
-	logger.Info("ServiceEntry created successfully", "ServiceEntry", serviceEntry.Name)
-	return serviceEntry, nil
+	serviceEntry.Spec.Ports = appendCoreServicePortsToIstioServicePorts(serviceEntry.Spec.Ports[:0], service.Spec.Ports)
+	logger.Info("Try to create ServiceEntry",
+		"ServiceEntry", serviceEntry.Name,
+	)
 }
 
-// handleFinalizer handles the finalizer logic for the IstioAdaptiveRequestOptimizer resource
-func (r *IstioAdaptiveRequestOptimizerReconciler) handleFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithName(r.LoggerName)
-
-	// If the resource is marked for deletion
-	if helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
-		if err := r.cleanupSpecificEndpointAnnotations(ctx, optimizer, []string{*r.EndpointsAnnotationKey}); err != nil {
-			logger.Error(err, "Error cleaning up specific Endpoint annotations")
-			// Return with error to requeue and try cleanup again
-			return ctrl.Result{}, err
-		}
-
-		if err := r.cleanupSpecificPodAnnotations(ctx, optimizer, []string{*r.EndpointsAnnotationKey, *r.EndpointsPodScrapeAnnotationKey}); err != nil {
-			logger.Error(err, "Error cleaning up specific Pod annotations")
-			// Return with error to requeue and try cleanup again
-			return ctrl.Result{}, err
-		}
-
-		if err := r.removeFinalizer(ctx, optimizer); err != nil {
-			logger.Error(err, "Failed to remove finalizer")
-			// Return with error to requeue and try finalizer removal again
-			return ctrl.Result{}, err
-		}
+// It returns the dereference string if it's not nil, or a default value (e.g., "TCP") if it's nil.
+func safeDereferenceAppProtocol(appProtocolPtr *string) string {
+	if appProtocolPtr != nil {
+		return *appProtocolPtr
 	}
-	// After finalizer is handled, no need to requeue
-	return ctrl.Result{}, nil
+	return "TCP"
 }
 
-// addFinalizer adds the finalizer to the IstioAdaptiveRequestOptimizer
-func (r *IstioAdaptiveRequestOptimizerReconciler) addFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
-	if !helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
-		logger := log.FromContext(ctx).WithName(r.LoggerName)
-		logger.Info("Adding Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-		optimizer.SetFinalizers(append(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer))
-		// Update CR to add finalizer
-		if err := r.Update(ctx, optimizer); err != nil {
-			logger.Error(err, "Failed to add finalizer to IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-			return err
+func appendCoreServicePortsToIstioServicePorts(
+	istioServicePorts []*istioNetworkingV1.ServicePort,
+	coreServicePorts []corev1.ServicePort,
+) []*istioNetworkingV1.ServicePort {
+	for i := range coreServicePorts {
+		port := &coreServicePorts[i]
+		istioServicePort := &istioNetworkingV1.ServicePort{
+			Number:     uint32(port.Port),
+			Protocol:   safeDereferenceAppProtocol(port.AppProtocol),
+			Name:       port.Name,
+			TargetPort: uint32(port.TargetPort.IntValue()),
 		}
+		istioServicePorts = append(istioServicePorts, istioServicePort)
 	}
-	return nil
+	return istioServicePorts
 }
 
-// removeFinalizer removes the finalizer from the IstioAdaptiveRequestOptimizer
-func (r *IstioAdaptiveRequestOptimizerReconciler) removeFinalizer(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
-	if helpers.ContainsString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer) {
-		logger := log.FromContext(ctx).WithName(r.LoggerName)
-		logger.Info("Removing Finalizer for the IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-		optimizer.SetFinalizers(helpers.RemoveString(optimizer.GetFinalizers(), istioAdaptiveRequestOptimizerFinalizer))
-
-		// Update CR to remove the finalizer
-		if err := r.Update(ctx, optimizer); err != nil {
-			logger.Error(err, "Failed to remove finalizer from IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-			return err
+func namespaceInFilteredList(namespace string, filteredNamespaces []string) bool {
+	for _, ns := range filteredNamespaces {
+		if namespace == ns {
+			return true
 		}
 	}
-	return nil
-}
-
-// collectPortsToProcess returns the list of ServicePorts to process based on the optimizer spec and the Service.
-func (r *IstioAdaptiveRequestOptimizerReconciler) collectPortsToProcess(optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, service *corev1.Service) []corev1.ServicePort {
-	var portsToProcess []corev1.ServicePort
-	// TODO log and add a metric when the user add a port that does not exist in the service
-	if len(optimizer.Spec.ServicePorts) > 0 {
-		optimizerPortsMap := make(map[string]bool)
-		for _, optimizerPort := range optimizer.Spec.ServicePorts {
-			// Normalize protocol to "TCP" for "HTTP" and "gRPC"
-			normalizedProtocol := normalizeProtocol(optimizerPort.Protocol)
-			portProtocolKey := fmt.Sprintf("%d/%s", optimizerPort.Number, normalizedProtocol)
-			optimizerPortsMap[portProtocolKey] = true
-		}
-
-		for _, servicePort := range service.Spec.Ports {
-			// Ensure service port protocol is compared in a normalized form
-			normalizedServiceProtocol := normalizeProtocol(string(servicePort.Protocol))
-			portProtocolKey := fmt.Sprintf("%d/%s", servicePort.Port, normalizedServiceProtocol)
-			if _, exists := optimizerPortsMap[portProtocolKey]; exists {
-				portsToProcess = append(portsToProcess, servicePort)
-			}
-		}
-		return portsToProcess // Return early with the matched ports
-	}
-
-	// Default to using all ports from the service if no specific ports are defined in the optimizer
-	return service.Spec.Ports
-}
-
-// normalizeProtocol converts high-level protocol names to their underlying transport protocol.
-func normalizeProtocol(protocol string) string {
-	lowerProtocol := strings.ToLower(protocol)
-	switch lowerProtocol {
-	case "http", "grpc":
-		return "tcp" // Treat both HTTP and gRPC as TCP, in lowercase
-	default:
-		return lowerProtocol // Return the protocol in lowercase if not HTTP or gRPC
-	}
-}
-
-func (r *IstioAdaptiveRequestOptimizerReconciler) annotateEndpoints(ctx context.Context, endpoints corev1.Endpoints, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer) error {
-	// Skip if the optimizer is marked for deletion
-	if optimizer.GetDeletionTimestamp() != nil {
-		return nil
-	}
-
-	if len(optimizer.Spec.ServicePorts) > 0 {
-		// Add the optimizer annotation to the Endpoints object
-		if endpoints.Annotations == nil {
-			endpoints.Annotations = make(map[string]string)
-		}
-		endpoints.Annotations[*r.EndpointsAnnotationKey] = "true"
-
-		// Update the Endpoints object with the new annotations
-		if err := r.Update(ctx, &endpoints); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificEndpointAnnotations(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, annotationKeysToRemove []string) error {
-	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.Info("Cleaning up specific Endpoint annotations for IstioAdaptiveRequestOptimizer", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-
-	// Fetch the Endpoints object
-	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, endpoints); err != nil {
-		logger.Error(err, "Failed to fetch Endpoints for Service", "ServiceName", optimizer.Spec.ServiceName)
-		return err
-	}
-
-	modified := false
-	// Iterate over the list of annotation keys that need to be removed
-	for _, key := range annotationKeysToRemove {
-		if _, found := endpoints.Annotations[key]; found {
-			delete(endpoints.Annotations, key)
-			modified = true
-		}
-	}
-
-	// Update the Endpoints object to reflect the changes, if any annotation was removed
-	if modified {
-		err := r.Update(ctx, endpoints)
-		if err != nil {
-			logger.Error(err, "Failed to update Endpoints after removing specific annotations", "Endpoints", endpoints.Name, "keysRemoved", annotationKeysToRemove)
-			// If you want to handle errors in a specific way, do it here.
-			return err
-		}
-		logger.V(1).Info("Specific annotations removed from Endpoints", "Endpoints", endpoints.Name, "keysRemoved", annotationKeysToRemove)
-	}
-
-	return nil
-}
-
-func (r *IstioAdaptiveRequestOptimizerReconciler) cleanupSpecificPodAnnotations(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, annotationKeysToRemove []string) error {
-	logger := log.FromContext(ctx).WithName(r.LoggerName)
-	logger.Info("Initiating cleanup of specific Pod annotations", "IstioAdaptiveRequestOptimizer", optimizer.Name)
-	logger.Info("Preparing to remove Prometheus metrics for the service", "service_name", optimizer.Spec.ServiceName, "service_namespace", optimizer.Spec.ServiceNamespace)
-
-	// Define Prometheus metrics to be removed
-	metricsToRemove := []*prometheus.GaugeVec{
-		customMetrics.AlphaMetric,
-		customMetrics.DistanceMetric,
-		customMetrics.MultiplierMetric,
-		customMetrics.WeightMetric,
-		customMetrics.ResponseTimeMetric,
-		// Extend with additional metrics as necessary
-	}
-
-	// Retrieve the Service to access its Pod selector
-	service := &corev1.Service{}
-	if err := r.Get(ctx, client.ObjectKey{Name: optimizer.Spec.ServiceName, Namespace: optimizer.Spec.ServiceNamespace}, service); err != nil {
-		logger.Error(err, "Failed to retrieve the Service", "ServiceName", optimizer.Spec.ServiceName)
-		return err
-	}
-
-	// List all Pods in the namespace that match the Service's selector
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(optimizer.Spec.ServiceNamespace), client.MatchingLabels(service.Spec.Selector)); err != nil {
-		logger.Error(err, "Failed to list matching Pods for the Service", "ServiceName", optimizer.Spec.ServiceName)
-		return err
-	}
-
-	// Iterate through each Pod to remove metrics and annotations
-	for _, pod := range podList.Items {
-		// Remove Prometheus metrics associated with the Pod
-		for _, metricVec := range metricsToRemove {
-			if !metricVec.Delete(prometheus.Labels{"service_name": optimizer.Spec.ServiceName, "service_namespace": optimizer.Spec.ServiceNamespace, "pod_name": pod.Name, "pod_ip": pod.Status.PodIP}) {
-				logger.Info("No Prometheus metrics found for removal", "service_name", optimizer.Spec.ServiceName, "service_namespace", optimizer.Spec.ServiceNamespace)
-				continue
-			}
-			logger.Info("Prometheus metrics successfully removed", "service_name", optimizer.Spec.ServiceName, "service_namespace", optimizer.Spec.ServiceNamespace, "metric_name", metricVec)
-		}
-
-		// Remove specified annotations from the Pod
-		modified := false
-		for _, key := range annotationKeysToRemove {
-			if _, found := pod.Annotations[key]; found {
-				delete(pod.Annotations, key)
-				modified = true
-			}
-		}
-
-		// Update the Pod if any annotations were removed
-		if modified {
-			if err := r.Update(ctx, &pod); err != nil {
-				logger.Error(err, "Failed to update Pod after annotation removal", "PodName", pod.Name)
-				continue // Proceed with the next Pod instead of halting
-			}
-			logger.V(1).Info("Removed specified annotations from Pod", "PodName", pod.Name, "keysRemoved", annotationKeysToRemove)
-		}
-	}
-	return nil
-}
-
-func (r *IstioAdaptiveRequestOptimizerReconciler) updateOptimizerStatus(ctx context.Context, optimizer *optimizationv1alpha1.IstioAdaptiveRequestOptimizer, serviceEntries []*istioClientV1.ServiceEntry) error {
-	var statusEntries []optimizationv1alpha1.ServiceEntry
-	for _, serviceEntry := range serviceEntries {
-		statusEntries = append(statusEntries, optimizationv1alpha1.ServiceEntry{
-			Name:         serviceEntry.Name,
-			Namespace:    serviceEntry.Namespace,
-			CreationTime: serviceEntry.CreationTimestamp,
-		})
-	}
-
-	// Properly update the optimizer status with the new slice
-	optimizer.Status.ServiceEntries = statusEntries
-
-	return r.Status().Update(ctx, optimizer)
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *IstioAdaptiveRequestOptimizerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	namespacePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return helpers.NamespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
+		return namespaceInFilteredList(obj.GetNamespace(), r.NamespaceList)
 	})
+	ignoreStatusUpdatesPredicate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			// Only reconcile if the spec has changed
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+		},
+	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&optimizationv1alpha1.IstioAdaptiveRequestOptimizer{}).
+		For(&api.IstioAdaptiveRequestOptimizer{}).
 		WithEventFilter(namespacePredicate).
+		WithEventFilter(ignoreStatusUpdatesPredicate).
 		Complete(r)
 }
